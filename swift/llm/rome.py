@@ -3,7 +3,7 @@ from typing import Optional
 
 import json
 import torch
-from modelscope import GenerationConfig
+from transformers import GenerationConfig
 
 from swift.tuners import Swift
 from swift.tuners.rome import RomeConfig
@@ -35,8 +35,8 @@ def rome_infer(args: RomeArguments) -> None:
         num_beams=args.num_beams,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id)
-    logger.info(f'generation_config: {generation_config}')
     set_generation_config(model, generation_config)
+    logger.info(f'model.generation_config: {model.generation_config}')
     if args.overwrite_generation_config:
         generation_config.save_pretrained(args.ckpt_dir)
 
@@ -68,8 +68,7 @@ def rome_infer(args: RomeArguments) -> None:
     # Inference
     template: Template = get_template(args.template_type, tokenizer, args.system, args.max_length,
                                       args.truncation_strategy)
-    args.system = template.default_system
-    logger.info(f'system: {args.system}')
+    logger.info(f'system: {template.default_system}')
 
     # Inference
     if args.eval_human:

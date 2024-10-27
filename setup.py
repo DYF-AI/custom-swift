@@ -3,6 +3,9 @@
 import os
 import shutil
 from setuptools import find_packages, setup
+from typing import List
+
+from packaging import version
 
 
 def readme():
@@ -115,8 +118,25 @@ def parse_requirements(fname='requirements.txt', with_version=True):
     return gen_packages_items()
 
 
+def add_modelscope_requirement(install_requires: List[str]) -> None:
+    # The future version will remove.
+    try:
+        import modelscope
+        modelscope_version = modelscope.__version__
+    except ImportError:
+        modelscope_version = '1.18'
+
+    if version.parse(modelscope_version) >= version.parse('1.19'):
+        install_requires.append('datasets>=3.0')
+        install_requires.append('modelscope[datasets]>=1.19')
+    else:
+        install_requires.append('datasets<3.0')
+        install_requires.append('modelscope[datasets]>=1.17,<1.19')
+
+
 if __name__ == '__main__':
     install_requires, deps_link = parse_requirements('requirements.txt')
+    add_modelscope_requirement(install_requires)
     extra_requires = {}
     all_requires = []
     extra_requires['llm'], _ = parse_requirements('requirements/llm.txt')
@@ -125,7 +145,6 @@ if __name__ == '__main__':
     extra_requires['seq_parallel'], _ = parse_requirements('requirements/seq_parallel.txt')
     all_requires.extend(install_requires)
     all_requires.extend(extra_requires['llm'])
-    all_requires.extend(extra_requires['aigc'])
     all_requires.extend(extra_requires['eval'])
     all_requires.extend(extra_requires['seq_parallel'])
     extra_requires['seq_parallel'].extend(extra_requires['llm'])
@@ -151,10 +170,11 @@ if __name__ == '__main__':
             'License :: OSI Approved :: Apache Software License',
             'Operating System :: OS Independent',
             'Programming Language :: Python :: 3',
-            'Programming Language :: Python :: 3.7',
             'Programming Language :: Python :: 3.8',
             'Programming Language :: Python :: 3.9',
             'Programming Language :: Python :: 3.10',
+            'Programming Language :: Python :: 3.11',
+            'Programming Language :: Python :: 3.12',
         ],
         license='Apache License 2.0',
         tests_require=parse_requirements('requirements/tests.txt'),

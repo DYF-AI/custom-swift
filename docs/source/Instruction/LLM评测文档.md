@@ -15,7 +15,7 @@ SWIFT的eval能力使用了魔搭社区[评测框架EvalScope](https://github.co
 
 纯文本评测：
 ```text
-'obqa', 'AX_b', 'siqa', 'nq', 'mbpp', 'winogrande', 'mmlu', 'BoolQ', 'cluewsc', 'ocnli', 'lambada',
+'obqa', 'cmb', 'AX_b', 'siqa', 'nq', 'mbpp', 'winogrande', 'mmlu', 'BoolQ', 'cluewsc', 'ocnli', 'lambada',
 'CMRC', 'ceval', 'csl', 'cmnli', 'bbh', 'ReCoRD', 'math', 'humaneval', 'eprstmt', 'WSC', 'storycloze',
 'MultiRC', 'RTE', 'chid', 'gsm8k', 'AX_g', 'bustm', 'afqmc', 'piqa', 'lcsts', 'strategyqa', 'Xsum', 'agieval',
 'ocnli_fc', 'C3', 'tnews', 'race', 'triviaqa', 'CB', 'WiC', 'hellaswag', 'summedits', 'GaokaoBench',
@@ -69,15 +69,15 @@ pip install -e '.[eval]'
 ```shell
 # 原始模型 (单卡A100大约需要半小时)
 CUDA_VISIBLE_DEVCIES=0 swift eval --model_type qwen2-7b-instruct \
-    --eval_dataset ARC_e --infer_backend vllm
+    --eval_dataset ARC_c --infer_backend vllm
 
 # LoRA微调后
 CUDA_VISIBLE_DEVICES=0 swift eval --ckpt_dir qwen2-7b-instruct/vx-xxx/checkpoint-xxx \
-    --eval_dataset ARC_e --infer_backend vllm \
+    --eval_dataset ARC_c --infer_backend vllm \
     --merge_lora true \
 ```
 
-评测的参数列表可以参考[这里](./命令行参数.md#eval参数)。
+评测的参数列表可以参考[这里](命令行参数.md#eval参数)。
 
 请注意：评测结果会存储在{--eval_output_dir}/{--name}/{时间戳}下, 如果用户没有改变存储配置，则默认路径在:
 ```text
@@ -93,7 +93,7 @@ CUDA_VISIBLE_DEVICES=0 swift deploy --model_type qwen2-7b-instruct
 
 # 使用API进行评测
 # 如果是非swift部署, 则需要额外传入`--eval_is_chat_model true --model_type qwen2-7b-instruct`
-swift eval --eval_url http://127.0.0.1:8000/v1 --eval_dataset ARC_e
+swift eval --eval_url http://127.0.0.1:8000/v1 --eval_dataset ARC_c
 
 # LoRA微调后的模型同理
 ```

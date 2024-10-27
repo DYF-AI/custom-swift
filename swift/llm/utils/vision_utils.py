@@ -7,6 +7,7 @@ from typing import Any, Callable, List, TypeVar, Union
 import numpy as np
 import requests
 import torch
+from packaging import version
 
 # >>> internvl
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -89,7 +90,7 @@ def rescale_image(img: 'PIL.Image.Image', rescale_image: int = -1) -> 'PIL.Image
     ratio = width / height
     height_scaled = math.pow(rescale_image / ratio, 0.5)
     width_scaled = height_scaled * ratio
-    return T.Resize((int(width_scaled), int(height_scaled)))(img)
+    return T.Resize((int(height_scaled), int(width_scaled)))(img)
 
 
 _T = TypeVar('_T')
@@ -100,7 +101,11 @@ def load_file(path: Union[str, _T]) -> Union[BytesIO, _T]:
     if isinstance(path, str):
         path = path.strip()
         if path.startswith('http'):
-            content = requests.get(path).content
+            request_kwargs = {}
+            timeout = float(os.getenv('TIMEOUT', '60'))
+            if timeout > 0:
+                request_kwargs['timeout'] = timeout
+            content = requests.get(path, **request_kwargs).content
             res = BytesIO(content)
         elif os.path.exists(path):
             with open(path, 'rb') as f:
@@ -201,10 +206,11 @@ def draw_plot(img_dir: str, bbox: List[int], bbox_type: str, output_file: str):
 @load_file_decorator
 def load_video_cogvlm2(video_io: BytesIO) -> np.ndarray:
     from decord import cpu, VideoReader, bridge
+    from .template import get_env_args
     bridge.set_bridge('torch')
     clip_end_sec = 60
     clip_start_sec = 0
-    num_frames = 24
+    num_frames = get_env_args('num_frames', int, 24)
     decord_vr = VideoReader(video_io, ctx=cpu(0))
     duration = len(decord_vr)  # duration in terms of frames
     start_frame = int(clip_start_sec * decord_vr.get_avg_fps())
@@ -219,9 +225,11 @@ def load_video_cogvlm2(video_io: BytesIO) -> np.ndarray:
 @load_file_decorator
 def load_video_llava(video_io: BytesIO) -> np.ndarray:
     import av
+    from .template import get_env_args
     container = av.open(video_io)
     total_frames = container.streams.video[0].frames
-    indices = np.arange(0, total_frames, total_frames / 8).astype(int)
+    num_frames = get_env_args('num_frames', int, 16)
+    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
     frames = []
     container.seek(0)
     start_index = indices[0]
@@ -235,9 +243,7 @@ def load_video_llava(video_io: BytesIO) -> np.ndarray:
 
 
 @load_file_decorator
-def load_video_minicpmv(video_io: BytesIO):
-    MAX_NUM_FRAMES = 64
-
+def load_video_minicpmv_mplug_owl3(video_io: BytesIO, max_num_frames):
     from PIL import Image
     from decord import VideoReader, cpu  # pip install decord
 
@@ -250,17 +256,91 @@ def load_video_minicpmv(video_io: BytesIO):
     sample_fps = round(vr.get_avg_fps() / 1)  # FPS
     frame_idx = [i for i in range(0, len(vr), sample_fps)]
 
-    if len(frame_idx) > MAX_NUM_FRAMES:
-        frame_idx = uniform_sample(frame_idx, MAX_NUM_FRAMES)
+    if len(frame_idx) > max_num_frames:
+        frame_idx = uniform_sample(frame_idx, max_num_frames)
     frames = vr.get_batch(frame_idx).asnumpy()
     frames = [Image.fromarray(v.astype('uint8')) for v in frames]
     return frames
 
 
 @load_file_decorator
-def load_audio_qwen(audio_io: BytesIO, sampling_rate):
+def load_audio_qwen(audio_io: BytesIO, sampling_rate: int):
     import librosa
     return librosa.load(audio_io, sr=sampling_rate)[0]
+
+
+def load_video_qwen2(video_path: str):
+    from .template import get_env_args
+    import torchvision
+    from torchvision import io, transforms
+    from qwen_vl_utils.vision_process import (round_by_factor, FPS, FRAME_FACTOR, FPS_MIN_FRAMES, FPS_MAX_FRAMES,
+                                              VIDEO_MIN_PIXELS, VIDEO_MAX_PIXELS, VIDEO_TOTAL_PIXELS, smart_resize,
+                                              ceil_by_factor, floor_by_factor)
+    from torchvision.transforms import InterpolationMode
+
+    if version.parse(torchvision.__version__) >= version.parse('0.19'):
+        video_path = load_file(video_path)
+    video, _, info = io.read_video(
+        video_path,
+        pts_unit='sec',
+        output_format='TCHW',
+    )
+    nframes = get_env_args('nframes', int, None)
+    fps = get_env_args('fps', int, None)
+    size_factor = get_env_args('frame_factor', int, FRAME_FACTOR, ['size_factor'])
+    assert not (fps and nframes), 'Only accept either `fps` or `nframes`'
+    if nframes is not None:
+        nframes = round_by_factor(nframes, size_factor)
+    else:
+        if fps is None:
+            fps = FPS
+        nframes = video.size(0) / info['video_fps'] * fps
+        nframes = round_by_factor(nframes, size_factor)
+        min_frames = get_env_args('fps_min_frames', int, FPS_MIN_FRAMES, ['min_frames'])
+        max_frames = get_env_args('fps_max_frames', int, FPS_MAX_FRAMES, ['max_frames'])
+        if nframes < min_frames:
+            nframes = ceil_by_factor(min_frames, size_factor)
+        if nframes > max_frames:
+            nframes = floor_by_factor(max_frames, size_factor)
+
+    if not (size_factor <= nframes and nframes <= video.size(0)):
+        raise ValueError(f'nframes should in interval [{size_factor}, {video.size(0)}], but got {nframes}.')
+
+    idx = torch.linspace(0, video.size(0) - 1, nframes).round().long()
+    height, width = video.shape[2:]
+    video = video[idx]
+
+    min_pixels = get_env_args('video_min_pixels', int, VIDEO_MIN_PIXELS, ['min_pixels'])
+    total_pixels = get_env_args('video_total_pixels', int, VIDEO_TOTAL_PIXELS, ['total_pixels'])
+    max_pixels = get_env_args('video_max_pixels', int, None, ['max_pixels'])
+    if max_pixels is None:
+        max_pixels = VIDEO_MAX_PIXELS
+        max_pixels = max(min(max_pixels, total_pixels / nframes * size_factor), min_pixels * 1.05)
+    # resize
+    resized_height = get_env_args('resized_height', int, None)
+    resized_width = get_env_args('resized_width', int, None)
+    if resized_height and resized_width:
+        resized_height, resized_width = smart_resize(
+            resized_height,
+            resized_width,
+            factor=size_factor,
+        )
+    else:
+        resized_height, resized_width = smart_resize(
+            height,
+            width,
+            factor=size_factor,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+
+    video = transforms.functional.resize(
+        video,
+        [resized_height, resized_width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    ).float()
+    return video
 
 
 if __name__ == '__main__':

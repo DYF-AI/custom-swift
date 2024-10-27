@@ -5,6 +5,7 @@ This document provides training scripts for various human preference alignment a
 - [Environment Setup](#environment-setup)
 - [Dataset](#dataset)
 - [DPO](#dpo)
+- [RM](#rm)
 - [CPO](#cpo)
 - [ORPO](#orpo)
 - [SimPO](#simpo)
@@ -48,7 +49,7 @@ Hyperparameters
 
 It is recommended to train with the preferred answer part of the preference dataset before starting DPO training to ensure data fits the distribution requirements of the DPO algorithm.
 
-We also mix sft loss in the DPO loss to stabilize training; you can adjust the sft loss coefficient by setting the hyperparameter `sft_beta`, the default is 0.1
+We also mix sft loss in the DPO loss to stabilize training; you can adjust the sft loss coefficient by setting the hyperparameter `rpo_alpha`, the default is `1.`.
 
 For training script, we provide single card/multi-card device map/multi-card ddp versions, for brevity, only the single card version is given for subsequent algorithms.
 
@@ -59,7 +60,7 @@ swift rlhf \
     --rlhf_type dpo \
     --model_type llava1_6-mistral-7b-instruct \
     --beta 0.1 \
-    --sft_beta 0.1 \
+    --rpo_alpha 0.1 \
     --sft_type  lora \
     --dataset rlaif-v#1000 \
     --num_train_epochs  2  \
@@ -77,7 +78,7 @@ swift rlhf \
     --rlhf_type dpo \
     --model_type llava1_6-mistral-7b-instruct \
     --beta 0.1 \
-    --sft_beta 0.1 \
+    --rpo_alpha 0.1 \
     --sft_type  lora \
     --dataset rlaif-v#1000 \
     --num_train_epochs  2  \
@@ -99,7 +100,7 @@ swift rlhf \
     --rlhf_type dpo \
     --model_type llava1_6-mistral-7b-instruct \
     --beta 0.1 \
-    --sft_beta 0.1 \
+    --rpo_alpha 0.1 \
     --sft_type  lora \
     --dataset rlaif-v#1000 \
     --num_train_epochs  2  \
@@ -112,6 +113,30 @@ swift rlhf \
     --save_total_limit  2
 ```
 Model inference and deployment after training can refer to the best practice documentation for the corresponding model, [Mutlimodal Deployment Document](./mutlimodal-deployment.md) and [VLLM Inference Acceleration Document](./vllm-inference-acceleration.md)
+
+## RM
+[paper arvix](https://arxiv.org/abs/2203.02155)
+
+Reward Modeling phase in RLHF
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+swift rlhf \
+    --rlhf_type rm \
+    --model_type  internvl2-2b \
+    --sft_type  lora \
+    --dataset rlaif-v#1000 \
+    --num_train_epochs  2  \
+    --lora_target_modules  ALL  \
+    --gradient_checkpointing  true  \
+    --batch_size  1  \
+    --learning_rate  5e-5  \
+    --gradient_accumulation_steps  16  \
+    --warmup_ratio  0.03  \
+    --save_total_limit  2
+```
+
+The weights of the added value head will be saved in the `value_head.safetensors` or `value_head.bin` file.
 
 ## CPO
 [Paper arvix](https://arxiv.org/abs/2401.08417)

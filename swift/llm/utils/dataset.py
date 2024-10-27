@@ -10,7 +10,6 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import datasets.fingerprint
 import json
 import numpy as np
-import pandas as pd
 from datasets import Dataset as HfDataset
 from datasets import IterableDataset as HfIterableDataset
 from datasets import concatenate_datasets, interleave_datasets
@@ -20,7 +19,7 @@ from pandas import DataFrame
 from tqdm.auto import tqdm
 from transformers.utils import strtobool
 
-from swift.utils import get_logger, get_seed, is_dist, is_local_master, read_from_jsonl, transform_jsonl_to_df
+from swift.utils import get_logger, get_seed, is_dist, is_local_master, safe_ddp_context
 from swift.utils.torch_utils import _find_local_mac
 from .media import MediaCache, MediaTag
 from .preprocess import (AlpacaPreprocessor, ClsPreprocessor, ComposePreprocessor, ConversationsPreprocessor,
@@ -45,6 +44,25 @@ def _update_fingerprint_mac(*args, **kwargs):
 datasets.fingerprint._update_fingerprint = datasets.fingerprint.update_fingerprint
 datasets.fingerprint.update_fingerprint = _update_fingerprint_mac
 datasets.arrow_dataset.update_fingerprint = _update_fingerprint_mac
+
+
+def patch_num_proc(func_name: str):
+    _origin_func_name = f'_origin_{func_name}'
+    _old_func = getattr(HfDataset, func_name)
+
+    def new_func(self, *args, **kwargs):
+        if 'num_proc' not in kwargs:
+            num_proc = os.environ.get('DATASET_MAP_NPROC')
+            if num_proc:
+                kwargs['num_proc'] = int(num_proc)
+        return _old_func(self, *args, **kwargs)
+
+    setattr(HfDataset, _origin_func_name, _old_func)
+    setattr(HfDataset, func_name, new_func)
+
+
+for func_name in ['map', 'filter']:
+    patch_num_proc(func_name)
 
 standard_keys = {
     'query', 'query_role', 'response', 'rejected_response', 'system', 'history', 'history_roles', 'images', 'objects',
@@ -157,11 +175,16 @@ class DatasetName:
     coco_en_2 = 'coco-en-2'
     coco_en_2_mini = 'coco-en-2-mini'
     capcha_images = 'capcha-images'
+    latex_ocr_print = 'latex-ocr-print'
+    latex_ocr_handwrite = 'latex-ocr-handwrite'
     # for qwen-audio
     aishell1_zh = 'aishell1-zh'
     aishell1_zh_mini = 'aishell1-zh-mini'
     # for video
     video_chatgpt = 'video-chatgpt'
+    egoschema = 'egoschema'
+    llava_video_178k = 'llava-video-178k'
+    moviechat_1k_test = 'moviechat-1k-test'
 
     # rlhf
     hh_rlhf = 'hh-rlhf'
@@ -316,9 +339,6 @@ def load_ms_dataset(dataset_id: str,
                     use_hf: bool = False,
                     streaming: bool = False,
                     revision: Optional[str] = None) -> Optional[DATASET_TYPE]:
-    if not use_hf:
-        from modelscope import MsDataset
-
     if subset_split_list is None or len(subset_split_list) == 0:
         return None
     dataset_list = []
@@ -338,25 +358,29 @@ def load_ms_dataset(dataset_id: str,
             except Exception:
                 raise
         else:
+            from modelscope import MsDataset
             if is_dist() and not is_local_master():
                 force_redownload = False
             else:
                 force_redownload = strtobool(os.environ.get('FORCE_REDOWNLOAD', 'False'))
             download_mode = 'force_redownload' if force_redownload else 'reuse_dataset_if_exists'
-            try:
-                dataset = MsDataset.load(
-                    dataset_id,
-                    subset_name=subset_name,
-                    split=split,
-                    version=revision or 'master',
-                    download_mode=download_mode,
-                    use_streaming=streaming)
-            except ValueError as e:
-                logger.error(f'Dataset {dataset_id} load failed: subset_name={subset_name},'
-                             f'split={split} with error: {e}')
-                continue
-            except Exception:
-                raise
+            with safe_ddp_context():
+                for i in range(5):
+                    try:
+                        dataset = MsDataset.load(
+                            dataset_id,
+                            subset_name=subset_name,
+                            split=split,
+                            version=revision or 'master',
+                            download_mode=download_mode,
+                            use_streaming=streaming)
+                    except Exception as e:
+                        logger.error(f'Dataset {dataset_id} load failed: subset_name={subset_name},'
+                                     f'split={split} with error: {e}')
+                    else:
+                        break
+                else:
+                    continue
             if streaming and hasattr(dataset, '_hf_ds'):
                 dataset = dataset._hf_ds
                 if not isinstance(dataset, HfIterableDataset):
@@ -364,6 +388,8 @@ def load_ms_dataset(dataset_id: str,
             if hasattr(dataset, 'to_hf_dataset'):
                 dataset = dataset.to_hf_dataset()
         dataset_list.append(dataset)
+    if len(dataset_list) == 1:
+        return dataset_list[0]
     if not streaming:
         return concatenate_datasets(dataset_list)
     else:
@@ -429,8 +455,8 @@ def _post_preprocess(
             streaming_buffer_size = kwargs.get('streaming_buffer_size', 16384)
             if streaming_val_size > 0:
                 train_dataset = train_dataset.shuffle(seed=get_seed(random_state), buffer_size=streaming_buffer_size)
-                val_dataset = dataset.take(int(streaming_val_size))
-                train_dataset = dataset.skip(int(streaming_val_size))
+                val_dataset = train_dataset.take(int(streaming_val_size))
+                train_dataset = train_dataset.skip(int(streaming_val_size))
 
     res = []
     for dataset in [train_dataset, val_dataset]:
@@ -461,8 +487,10 @@ def get_dataset_from_repo(dataset_id: str,
         subset_split_list = split
     else:
         subset_split_list = list(itertools.product(subsets, split))
+
     dataset = load_ms_dataset(
         dataset_id, subset_split_list, use_hf, streaming=streaming, revision=kwargs.get('revision'))
+
     return _post_preprocess(dataset, dataset_sample, random_state, preprocess_func, dataset_test_ratio,
                             remove_useless_columns, **kwargs)
 
@@ -633,8 +661,11 @@ def get_mantis_dataset(dataset_id: str,
         dataset = load_ms_dataset(dataset_id, [subset], use_hf, streaming=streaming)
         dataset = preprocess_mantis_image(dataset, subset=subset[0])
         all_datasets.append(dataset)
-        break
-    dataset = concatenate_datasets(all_datasets) if not streaming else interleave_datasets(all_datasets)
+
+    if len(all_datasets) > 1:
+        dataset = concatenate_datasets(all_datasets) if not streaming else interleave_datasets(all_datasets)
+    else:
+        dataset = all_datasets[0]
     return _post_preprocess(dataset, dataset_sample, random_state, preprocess_func, dataset_test_ratio,
                             remove_useless_columns, **kwargs)
 
@@ -666,26 +697,25 @@ def preprocess_llava_data(dataset: DATASET_TYPE) -> DATASET_TYPE:
     all_folders = {}
     for media_type in ['coco', 'gqa', 'ocr_vqa', 'textvqa', 'VG_100K', 'VG_100K_2']:
         all_folders[media_type] = MediaCache.download(media_type)
-    dataset._image_dir = all_folders
 
-    def preprocess_image(example):
+    def preprocess_image(example, all_folders):
         if not example['images']:
             return {}
         images = [p['path'] for p in example['images']]
         new_images = []
         for image in images:
             if 'coco/' in image:
-                image = os.path.join(dataset._image_dir['coco'], image.replace('coco/', ''))
+                image = os.path.join(all_folders['coco'], image.replace('coco/', ''))
             elif 'gqa/' in image:
-                image = os.path.join(dataset._image_dir['gqa'], image.replace('gqa/', ''))
+                image = os.path.join(all_folders['gqa'], image.replace('gqa/', ''))
             elif 'ocr_vqa/' in image:
-                image = os.path.join(dataset._image_dir['ocr_vqa'], image)
+                image = os.path.join(all_folders['ocr_vqa'], image)
             elif 'textvqa/' in image:
-                image = os.path.join(dataset._image_dir['textvqa'], image.replace('textvqa/', ''))
+                image = os.path.join(all_folders['textvqa'], image.replace('textvqa/', ''))
             elif 'VG_100K/' in image:
-                image = os.path.join(dataset._image_dir['VG_100K'], image.replace('vg/', ''))
+                image = os.path.join(all_folders['VG_100K'], image.replace('vg/', ''))
             elif 'VG_100K_2/' in image:
-                image = os.path.join(dataset._image_dir['VG_100K_2'], image.replace('vg/', ''))
+                image = os.path.join(all_folders['VG_100K_2'], image.replace('vg/', ''))
             new_images.append(image)
         if all(os.path.exists(image) for image in new_images):
             example['images'] = new_images
@@ -696,7 +726,8 @@ def preprocess_llava_data(dataset: DATASET_TYPE) -> DATASET_TYPE:
     kwargs = {}
     if not isinstance(dataset, HfIterableDataset):
         kwargs['load_from_cache_file'] = dataset_enable_cache
-    dataset = dataset.map(preprocess_image, **kwargs).filter(lambda row: row['images'])
+    dataset = dataset.map(partial(preprocess_image, all_folders=all_folders),
+                          **kwargs).filter(lambda row: row['images'])
     return ConversationsPreprocessor(
         user_role='user',
         assistant_role='assistant',
@@ -748,9 +779,12 @@ def _preprocess_vision_dataset2(dataset: DATASET_TYPE) -> DATASET_TYPE:
         if '&&' in d[response_key]:
             d[response_key] = d[response_key].split('&&')[0]
         response = d[response_key]
-        return {'query': query * len(response), 'response': response, 'images': images}
+        return {'query': query, 'response': response, 'images': images}
 
-    return dataset.map(_process)
+    kwargs = {}
+    if not isinstance(dataset, HfIterableDataset):
+        kwargs['load_from_cache_file'] = dataset_enable_cache
+    return dataset.map(_process, **kwargs)
 
 
 register_dataset(
@@ -864,7 +898,185 @@ register_dataset(
     _preprocess_video_chatgpt,
     get_dataset_from_repo,
     split=['test'],
+    hf_dataset_id='lmms-lab/VideoChatGPT',
     tags=['chat', 'multi-modal', 'video', '🔥'])
+
+
+def _preprocess_egoschema(dataset: DATASET_TYPE) -> DATASET_TYPE:
+    for i in range(1, 6):
+        url = f'https://modelscope.cn/datasets/AI-ModelScope/egoschema/resolve/master/videos_chunked_0{i}.zip'
+        local_dir = MediaCache.download(url, 'egoschema')
+
+    local_dir = os.path.join(local_dir, 'videos')
+    mp4_set = [file[:-4] for file in os.listdir(local_dir) if file.endswith('mp4')]
+
+    def _process(d):
+        transfer_to_option = {
+            '0': 'A',
+            '1': 'B',
+            '2': 'C',
+            '3': 'D',
+            '4': 'E',
+        }
+        if d['video_idx'] not in mp4_set:
+            return {'query': None, 'response': None, 'videos': None}
+        return {
+            'query': d['question'] + '\n' + str(d['option']),
+            'response': transfer_to_option[d['answer']],
+            'videos': [os.path.join(local_dir, f"{d['video_idx']}.mp4")],
+        }
+
+    return dataset.map(_process).filter(lambda row: row['query'] is not None)
+
+
+register_dataset(
+    DatasetName.egoschema,
+    'AI-ModelScope/egoschema', ['Subset'],
+    _preprocess_egoschema,
+    get_dataset_from_repo,
+    split=['test'],
+    hf_dataset_id='lmms-lab/egoschema',
+    tags=['chat', 'multi-modal', 'video'])
+
+
+def preprocess_llava_video_178k(dataset: DATASET_TYPE, subset, dataset_id) -> DATASET_TYPE:
+
+    dataset_dir = '/mnt/workspace/.cache/modelscope/datasets'  # YOUR PATH TO `lmms-lab` directory
+    local_dir = f'{dataset_dir}/{dataset_id}/{subset}/'
+
+    if not os.path.exists(local_dir):
+        logger.error(
+            'The video files of this lmms-lab/LLaVA-Video-178K dataset are separately zipped, therefore you need to'
+            ' download the video files from HF or MS and extract the .tar.gz files. Then, please write the path to the'
+            ' `lmms-lab` directory (with extracted video files in lmms-lab/LLaVA-Video-178K) in the'
+            ' preprocess_llava_video_178k() in swift/llm/utils/dataset.py.')
+        raise FileNotFoundError('Please download and extract the video files first. See details in the log.')
+
+    def _process(d):  # after this process, the data will undergo _post_preprocess() of ConversationsPreprocessor
+        file_path = os.path.join(local_dir, f"{d['video']}")
+        if not os.path.exists(file_path):
+            return {'id': None, 'conversations': None, 'data_source': None, 'video': None}
+        return {
+            'id': d['id'],
+            'conversations': d['conversations'],
+            'data_source': d['data_source'],
+            'video': [file_path],
+        }
+
+    return dataset.map(_process).filter(lambda row: row['conversations'] is not None)
+
+
+def get_llava_video_178k_dataset(dataset_id: str,
+                                 subsets: Optional[List[str]],
+                                 preprocess_func: PreprocessFunc,
+                                 split: List[str],
+                                 dataset_sample: int = -1,
+                                 *,
+                                 random_state: Optional[RandomState] = None,
+                                 dataset_test_ratio: float = 0.,
+                                 remove_useless_columns: bool = True,
+                                 use_hf: bool = False,
+                                 **kwargs) -> Tuple[HfDataset, Optional[HfDataset]]:
+    streaming = kwargs.get('streaming', False)
+    if subsets is None:
+        subsets = []
+    assert len(split) > 0
+    if len(subsets) == 0:
+        subset_split_list = split
+    else:
+        subset_split_list = list(itertools.product(subsets, split))
+    all_datasets = []
+    for subset in subset_split_list:
+        dataset = load_ms_dataset(dataset_id, [subset], use_hf, streaming=streaming)
+        dataset = preprocess_llava_video_178k(dataset, subset[0], dataset_id)
+        all_datasets.append(dataset)
+    if len(all_datasets) > 1:
+        dataset = concatenate_datasets(all_datasets) if not streaming else interleave_datasets(all_datasets)
+    else:
+        dataset = all_datasets[0]
+    return _post_preprocess(dataset, dataset_sample, random_state, preprocess_func, dataset_test_ratio,
+                            remove_useless_columns, **kwargs)
+
+
+register_dataset(
+    DatasetName.llava_video_178k,
+    'lmms-lab/LLaVA-Video-178K', [
+        '0_30_s_academic_v0_1',
+        '0_30_s_youtube_v0_1',
+        '1_2_m_academic_v0_1',
+        '1_2_m_youtube_v0_1',
+        '2_3_m_academic_v0_1',
+        '2_3_m_youtube_v0_1',
+        '30_60_s_academic_v0_1',
+        '30_60_s_youtube_v0_1',
+    ],
+    ConversationsPreprocessor(
+        user_role='human',
+        assistant_role='gpt',
+        conversations_key='conversations',
+        from_key='from',
+        value_key='value',
+        media_type='video',
+        media_key='video',
+        error_strategy='delete'),
+    get_llava_video_178k_dataset,
+    split=['caption', 'open_ended', 'multi_choice'],
+    hf_dataset_id='lmms-lab/LLaVA-Video-178K',
+    huge_dataset=True,
+    tags=['chat', 'multi-modal', 'video'])
+
+
+def _preprocess_moviechat_1k_test(dataset: DATASET_TYPE) -> DATASET_TYPE:
+    mp4_set = [f'{i}.mp4' for i in range(1, 10)] + \
+              [f'{i}.mp4' for i in range(201, 240)] + \
+              [f'AWA-{i}.mp4' for i in range(1, 10)] + \
+              [f'AWB-{i}.mp4' for i in range(1, 16)] + \
+              [f'AWC-{i}.mp4' for i in range(1, 11)] + \
+              [f'AWD-{i}.mp4' for i in range(1, 8)] + \
+              [f'AWE-{i}.mp4' for i in range(1, 7)] + \
+              [f'AWG-{i}.mp4' for i in range(1, 12)] + \
+              [f'AWH-{i}.mp4' for i in range(1, 8)] + \
+              [f'BWA-{i}.mp4' for i in range(1, 7)] + \
+              [f'BWB-{i}.mp4' for i in range(1, 7)] + \
+              [f'BWD-{i}.mp4' for i in range(1, 6)] + \
+              [f'BWE-{i}.mp4' for i in range(1, 6)] + \
+              [f'BWG-{i}.mp4' for i in range(1, 6)] + \
+              [f'BWH-{i}.mp4' for i in range(1, 6)] + \
+              [f'TFS-{i}.mp4' for i in range(1, 13)] + \
+              [f'UWA-{i}.mp4' for i in range(1, 5)] + ['UWA-6.mp4']
+    for file in mp4_set:
+        url = f'https://modelscope.cn/datasets/AI-ModelScope/MovieChat-1K-test/resolve/master/videos/{file}'
+        local_dir = MediaCache.download(url, 'moviechat_1k_test', is_not_compressed_file=True)
+
+    def _process(batch):  # bsz==1
+        file_path = os.path.join(local_dir, f"{batch['info'][0]['video_path']}")
+        if not os.path.exists(file_path):
+            return {'res': [{'query': None, 'response': None, 'video': None}]}
+        res = []
+        for qa in batch['global'][0]:
+            res.append({
+                'query': qa['question'],
+                'response': qa['answer'],
+                'video': file_path,
+            })
+        return {'res': res}
+
+    dict_list = dataset.map(_process, batched=True, batch_size=1, remove_columns=dataset.column_names)['res']
+    import pandas as pd
+    from modelscope import MsDataset
+    hf_dataset = HfDataset.from_pandas(pd.DataFrame(dict_list)).filter(lambda row: row['video'] is not None)
+    return hf_dataset
+
+
+register_dataset(
+    DatasetName.moviechat_1k_test,
+    'AI-ModelScope/MovieChat-1K-test',
+    None,
+    _preprocess_moviechat_1k_test,
+    get_dataset_from_repo,
+    split=['test'],
+    hf_dataset_id='Enxin/MovieChat-1K-test',
+    tags=['chat', 'multi-modal', 'video'])
 
 
 def _repair_agent_conversations(conversations: str, use_mini: bool) -> Optional[List[Dict[str, str]]]:
@@ -1221,27 +1433,25 @@ def _preprocess_sharegpt4v(dataset: DATASET_TYPE) -> DATASET_TYPE:
     for sp in split:
         for media_type in IMAGE_DATASET_REQUIREMENTS[sp]:
             all_folders[media_type] = MediaCache.download(media_type)
-    dataset._image_dir = all_folders
 
-    def preprocess_image(example):
+    def preprocess_image(example, all_folders):
         image = example['image']
         if 'coco/' in image:
-            image = os.path.join(dataset._image_dir['coco'], image.replace('coco/', ''))
+            image = os.path.join(all_folders['coco'], image.replace('coco/', ''))
         elif 'sam/' in image:
-            image = os.path.join(dataset._image_dir['sam'], image.replace('sam/images/', ''))
+            image = os.path.join(all_folders['sam'], image.replace('sam/images/', ''))
         elif 'llava/' in image:
-            image = os.path.join(dataset._image_dir['llava'], image.replace('llava/llava_pretrain/images/', ''))
+            image = os.path.join(all_folders['llava'], image.replace('llava/llava_pretrain/images/', ''))
         elif 'wikiart/' in image:
-            image = os.path.join(dataset._image_dir['wikiart'], image.replace('wikiart/images/',
-                                                                              'data/wikiart/images/'))
+            image = os.path.join(all_folders['wikiart'], image.replace('wikiart/images/', 'data/wikiart/images/'))
         elif 'share_textvqa/' in image:
-            image = os.path.join(dataset._image_dir['share_textvqa'],
+            image = os.path.join(all_folders['share_textvqa'],
                                  image.replace('share_textvqa/images/', 'data/share_textvqa/images/'))
         elif 'web-celebrity/' in image:
-            image = os.path.join(dataset._image_dir['web-celebrity'],
+            image = os.path.join(all_folders['web-celebrity'],
                                  image.replace('web-celebrity/images/', 'data/web-celebrity/images/'))
         elif 'web-landmark/' in image:
-            image = os.path.join(dataset._image_dir['web-landmark'],
+            image = os.path.join(all_folders['web-landmark'],
                                  image.replace('web-landmark/images/', 'data/web-landmark/images/'))
         if os.path.exists(image):
             example['images'] = image
@@ -1252,7 +1462,8 @@ def _preprocess_sharegpt4v(dataset: DATASET_TYPE) -> DATASET_TYPE:
     kwargs = {}
     if not isinstance(dataset, HfIterableDataset):
         kwargs['load_from_cache_file'] = dataset_enable_cache
-    dataset = dataset.map(preprocess_image, **kwargs).filter(lambda example: example['images'] is not None)
+    dataset = dataset.map(partial(preprocess_image, all_folders=all_folders),
+                          **kwargs).filter(lambda example: example['images'] is not None)
     processer = ConversationsPreprocessor(
         user_role='human', assistant_role='gpt', media_type='image', media_key='images', error_strategy='delete')
     return processer(dataset)
@@ -1412,7 +1623,7 @@ register_dataset(
     'swift/TextCaps', [],
     preprocess_func=preprocess_text_caps,
     get_function=get_dataset_from_repo,
-    split=['train', 'val'],
+    split=['train', 'validation'],
     hf_dataset_id='HuggingFaceM4/TextCaps',
     huge_dataset=True,
     tags=['multi-modal', 'en', 'caption', 'quality'])
@@ -1432,22 +1643,21 @@ def _preprocess_llava_instruct_images(dataset: DATASET_TYPE) -> DATASET_TYPE:
     all_folders = {}
     for media_type in ['coco', 'gqa', 'ocr_vqa', 'textvqa', 'VG_100K', 'VG_100K_2']:
         all_folders[media_type] = MediaCache.download(media_type)
-    dataset._image_dir = all_folders
 
-    def preprocess_image(example):
+    def preprocess_image(example, all_folders):
         image = example['image']
         if 'coco/' in image:
-            image = os.path.join(dataset._image_dir['coco'], image.replace('coco/', ''))
+            image = os.path.join(all_folders['coco'], image.replace('coco/', ''))
         elif 'gqa/' in image:
-            image = os.path.join(dataset._image_dir['gqa'], image.replace('gqa/', ''))
+            image = os.path.join(all_folders['gqa'], image.replace('gqa/', ''))
         elif 'ocr_vqa/' in image:
-            image = os.path.join(dataset._image_dir['ocr_vqa'], image)
+            image = os.path.join(all_folders['ocr_vqa'], image)
         elif 'textvqa/' in image:
-            image = os.path.join(dataset._image_dir['textvqa'], image.replace('textvqa/', ''))
+            image = os.path.join(all_folders['textvqa'], image.replace('textvqa/', ''))
         elif 'VG_100K/' in image:
-            image = os.path.join(dataset._image_dir['VG_100K'], image.replace('vg/', ''))
+            image = os.path.join(all_folders['VG_100K'], image.replace('vg/', ''))
         elif 'VG_100K_2/' in image:
-            image = os.path.join(dataset._image_dir['VG_100K_2'], image.replace('vg/', ''))
+            image = os.path.join(all_folders['VG_100K_2'], image.replace('vg/', ''))
         if os.path.exists(image):
             example['images'] = image
         else:
@@ -1457,7 +1667,8 @@ def _preprocess_llava_instruct_images(dataset: DATASET_TYPE) -> DATASET_TYPE:
     kwargs = {}
     if not isinstance(dataset, HfIterableDataset):
         kwargs['load_from_cache_file'] = dataset_enable_cache
-    dataset = dataset.map(preprocess_image, **kwargs).filter(lambda example: example['images'] is not None)
+    dataset = dataset.map(partial(preprocess_image, all_folders=all_folders),
+                          **kwargs).filter(lambda example: example['images'] is not None)
     processer = ConversationsPreprocessor(
         user_role='human', assistant_role='gpt', media_type='image', media_key='images', error_strategy='delete')
     return processer(dataset)
@@ -1787,7 +1998,7 @@ def preprocess_science_qa(dataset: DATASET_TYPE):
         query = row['question']
         response = row['choices'][row['answer']]
         solution = row['solution']
-        return {'query': query, 'response': f'{solution}\nSo the final answer is:{response}'}
+        return {'query': query, 'response': f'{solution}\nSo the final answer is: {response}'}
 
     kwargs = {}
     if not isinstance(dataset, HfIterableDataset):
@@ -2031,16 +2242,48 @@ register_dataset(
     tags=['chat', 'general', 'multi-round'])
 
 
+def _preprocess_latex_ocr_dataset(dataset: DATASET_TYPE) -> DATASET_TYPE:
+    from datasets import Image
+    prompt = 'Using LaTeX to perform OCR on the image.'
+
+    def _process(d):
+        return {'query': prompt, 'response': d['text']}
+
+    kwargs = {}
+    if not isinstance(dataset, HfIterableDataset):
+        kwargs['load_from_cache_file'] = dataset_enable_cache
+    return dataset.map(_process, **kwargs).rename_column('image', 'images')
+
+
+register_dataset(
+    DatasetName.latex_ocr_print,
+    'AI-ModelScope/LaTeX_OCR',
+    ['full'],
+    _preprocess_latex_ocr_dataset,
+    get_dataset_from_repo,
+    split=['validation', 'test'],  # There are some problems in the training dataset.
+    hf_dataset_id='linxy/LaTeX_OCR',
+    tags=['chat', 'ocr', 'multi-modal', 'vision'])
+
+register_dataset(
+    DatasetName.latex_ocr_handwrite,
+    'AI-ModelScope/LaTeX_OCR', ['synthetic_handwrite'],
+    _preprocess_latex_ocr_dataset,
+    get_dataset_from_repo,
+    split=['train', 'validation', 'test'],
+    hf_dataset_id='linxy/LaTeX_OCR',
+    tags=['chat', 'ocr', 'multi-modal', 'vision'])
+
+
 def _preprocess_capcha_images(dataset: DATASET_TYPE) -> DATASET_TYPE:
     from datasets import Image
     query = 'recognize the content.'
-    image_key = 'image'
     response_key = 'solution'
 
     def _process(d):
-        return {'query': query * len(d[response_key]), 'response': d[response_key], 'images': [d[image_key]]}
+        return {'query': query, 'response': d[response_key]}
 
-    return dataset.map(_process).cast_column('image', Image(decode=True))
+    return dataset.map(_process).rename_column('image', 'images')
 
 
 register_dataset(
@@ -2556,10 +2799,10 @@ def _preprocess_self_cognition_dataset(
                         model_n, model_a = model_name[0], model_author[0]
                     else:
                         model_n, model_a = model_name[1], model_author[1]
-                        yield {
-                            'query': d['query'].replace('{{NAME}}', model_n).replace('{{AUTHOR}}', model_a),
-                            'response': d['response'].replace('{{NAME}}', model_n).replace('{{AUTHOR}}', model_a)
-                        }
+                    yield {
+                        'query': d['query'].replace('{{NAME}}', model_n).replace('{{AUTHOR}}', model_a),
+                        'response': d['response'].replace('{{NAME}}', model_n).replace('{{AUTHOR}}', model_a)
+                    }
 
             dataset = HfIterableDataset.from_generator(generate_example, gen_kwargs={'dataset': dataset})
         else:
@@ -2707,13 +2950,16 @@ def get_dataset(
         if val_d is not None:
             val_dataset_list.append(val_d)
 
-    train_dataset = None
-    if len(train_dataset_list) > 0:
+    if len(train_dataset_list) > 1:
         train_dataset = concatenate_datasets(train_dataset_list) if not streaming else interleave_datasets(
             train_dataset_list)
-    val_dataset = None
-    if len(val_dataset_list) > 0:
+    else:
+        train_dataset = train_dataset_list[0] if train_dataset_list else None
+
+    if len(val_dataset_list) > 1:
         val_dataset = concatenate_datasets(val_dataset_list) if not streaming else interleave_datasets(val_dataset_list)
+    else:
+        val_dataset = val_dataset_list[0] if val_dataset_list else None
     if check_dataset_strategy != 'none':
         logger.info('check dataset...')
         logger.info(f"check_dataset_strategy: '{check_dataset_strategy}'")
@@ -2747,8 +2993,10 @@ def load_dataset_from_local(dataset_path_list: Optional[Union[str, List[str]]],
         dataset = preprocess_func(dataset)
         if streaming:
             dataset = dataset.to_iterable_dataset()
-        dataset_list.append(preprocess_func(dataset))
+        dataset_list.append(dataset)
 
+    if len(dataset_list) == 1:
+        return dataset_list[0]
     return concatenate_datasets(dataset_list) if not streaming else interleave_datasets(dataset_list)
 
 

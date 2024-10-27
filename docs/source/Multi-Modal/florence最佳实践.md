@@ -147,7 +147,7 @@ CUDA_VISIBLE_DEVICES=0 swift sft \
 
 ```
 
-[自定义数据集](../LLM/自定义与拓展.md#-推荐命令行参数的形式)支持json, jsonl样式, 以下是自定义数据集的例子:
+[自定义数据集](../Instruction/自定义与拓展.md#-推荐命令行参数的形式)支持json, jsonl样式, 以下是自定义数据集的例子:
 
 (只支持单轮对话, 每轮对话必须包含一张图片, 支持传入本地路径或URL)
 
@@ -165,7 +165,8 @@ CUDA_VISIBLE_DEVICES=0 swift sft \
 2. 对于给定目标询问bounding box的任务,在query中指定`<ref-object>`, 在response中指定`<bbox>`, 在`objects`提供目标和bounding box具体信息
 ```jsonl
 {"query": "Find <bbox>", "response": "<ref-object>", "images": ["/coco2014/train2014/COCO_train2014_000000001507.jpg"], "objects": "[{\"caption\": \"guy in red\", \"bbox\": [138, 136, 235, 359], \"bbox_type\": \"real\", \"image\": 0}]" }
-{"query": "Find <ref-object>", "response": "<bbox>", "images": ["/coco2014/train2014/COCO_train2014_000000001507.jpg"], "objects": "[{\"caption\": \"guy in red\", \"bbox\": [138, 136, 235, 359], \"bbox_type\": \"real\", \"image\": 0}]" }
+# mapping to multiple bboxes
+{"query": "Find <ref-object>", "response": "<bbox>", "images": ["/coco2014/train2014/COCO_train2014_000000001507.jpg"], "objects": "[{\"caption\": \"guy in red\", \"bbox\": [[138, 136, 235, 359],[1,2,3,4]], \"bbox_type\": \"real\", \"image\": 0}]" }
 ```
 上述objects字段中包含了一个json string，其中有四个字段：
     a. caption bbox对应的物体描述

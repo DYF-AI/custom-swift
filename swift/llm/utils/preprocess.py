@@ -1,8 +1,10 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import ast
 import os
+from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+import numpy as np
 from datasets import Dataset as HfDataset
 from datasets import IterableDataset as HfIterableDataset
 from tqdm import tqdm
@@ -12,17 +14,17 @@ from swift.utils import get_logger
 from .media import MediaTag
 from .template import History
 
-PreprocessFunc = Callable[[HfDataset], HfDataset]
 dataset_enable_cache = strtobool(os.environ.get('DATASET_ENABLE_CACHE', 'False'))
 
 DATASET_TYPE = Union[HfDataset, HfIterableDataset]
+PreprocessFunc = Callable[[DATASET_TYPE], DATASET_TYPE]
 
 logger = get_logger()
 
 
 def _reduce_columns(cls: type) -> type:
     # Remove unnecessary columns from the output dataset.
-    if getattr(cls, '_patching', False):
+    if getattr(cls, '_patching', False) or dataset_enable_cache:
         return cls
 
     call_func = cls.__call__
@@ -30,29 +32,53 @@ def _reduce_columns(cls: type) -> type:
     cls._patching = True
 
     def new_call_func(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
-        self.column_state = set(['images', 'videos', 'audios'])
+        self.key_mapping = {k: i for i, k in enumerate(self.empty_row.keys())}
+        num_proc = int(os.environ.get('DATASET_MAP_NPROC', '1'))
+        self.shared_shm_name = None
+        shm, buffer = None, None
+        if num_proc > 1:  # multiprocess
+            shm = shared_memory.SharedMemory(create=True, size=len(self.key_mapping))
+            self.shared_shm_name = shm.name
+            buffer = shm.buf
+        self.column_state = np.ndarray((len(self.key_mapping), ), dtype=np.bool_, buffer=buffer)
+        self.column_state[:] = False
         dataset = call_func(self, dataset)
         if isinstance(dataset, HfIterableDataset) and dataset.features is None:
             features = next(iter(dataset)).keys()
         else:
             features = dataset.features.keys()
         for k in features:
-            if k not in self.column_state:
+            if k in ['images', 'videos', 'audios']:
+                continue
+            k_i = self.key_mapping.get(k, -1)
+            if k_i == -1 or not self.column_state[k_i]:
                 dataset = dataset.remove_columns([k])
+        if shm:
+            shm.close()
+            shm.unlink()
         return dataset
 
     def new_preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        if self.shared_shm_name is not None:  # multiprocess
+            shm = shared_memory.SharedMemory(name=self.shared_shm_name)
+            column_state = np.ndarray((len(self.key_mapping), ), dtype=np.bool_, buffer=shm.buf)
+        else:
+            column_state = self.column_state
         row = preprocess(self, row)
         for k, v in row.items():
+            if k in ['images', 'videos', 'audios']:
+                continue
+            k_i = self.key_mapping[k]
+            if column_state[k_i]:
+                continue
             if k == 'query_role':
-                if k not in self.column_state and v and v != 'user':
-                    self.column_state.add(k)
+                if v and v != 'user':
+                    column_state[k_i] = True
             elif k == 'history_roles':
-                if k not in self.column_state and v and any(_v[0] != 'user' or _v[1] != 'assistant' for _v in v):
-                    self.column_state.add(k)
-            else:
-                if v:
-                    self.column_state.add(k)
+                if v and any(_v[0] != 'user' or _v[1] != 'assistant' for _v in v):
+                    column_state[k_i] = True
+            elif v:
+                column_state[k_i] = True
         return row
 
     cls.__call__ = new_call_func
@@ -172,11 +198,6 @@ class AlpacaPreprocessor(MediaMixin, RowPreprocessMixin):
         }
         medias = self.parse_medias(d)
         self.media_replacer(row, medias)
-        if self.media_type:
-            if not isinstance(self.media_key, str):
-                row[self.media_name] = medias
-            else:
-                row[self.media_key] = medias
         return row
 
     def __call__(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
@@ -250,7 +271,11 @@ class ConversationsPreprocessor(MediaMixin, RowPreprocessMixin):
                 assert q[self.from_key] in [self.user_role, self.tool_role]
                 assert r[self.from_key] == self.assistant_role
                 h.append([q[self.value_key], r[self.value_key]])
-                hr.append([q[self.from_key], r[self.from_key]])
+                _q_role = q[self.from_key]
+                _r_role = r[self.from_key]
+                _q_role = _q_role if _q_role == 'tool' else 'user'
+                _r_role = _r_role if _r_role == 'tool' else 'assistant'
+                hr.append([_q_role, _r_role])
             query = conversations[-2][self.value_key]
             query_role = conversations[-2][self.from_key]
             query_role = query_role if query_role == 'tool' else 'user'
@@ -267,11 +292,6 @@ class ConversationsPreprocessor(MediaMixin, RowPreprocessMixin):
             })
             medias = self.parse_medias(d)
             self.media_replacer(row, medias)
-            if self.media_type:
-                if not isinstance(self.media_key, str):
-                    row[self.media_name] = medias
-                else:
-                    row[self.media_key] = medias
             return row
         except (AssertionError, SyntaxError) as e:
             logger.error(e)
@@ -327,11 +347,6 @@ class ListPreprocessor(MediaMixin, RowPreprocessMixin):
             }
             medias = self.parse_medias(d)
             self.media_replacer(row, medias)
-            if self.media_type:
-                if not isinstance(self.media_key, str):
-                    row[self.media_name] = medias
-                else:
-                    row[self.media_key] = medias
         except Exception:
             if self.error_strategy == 'raise':
                 raise ValueError(f'conversations: {conversations}')

@@ -10,8 +10,8 @@ from .dataset import (DATASET_MAPPING, DatasetName, HfDataset, get_dataset, get_
 from .media import MediaCache, MediaTag
 from .model import (MODEL_MAPPING, GetModelTokenizerFunction, LoRATM, ModelType, get_additional_saved_files,
                     get_default_lora_target_modules, get_default_template_type, get_model_tokenizer,
-                    get_model_tokenizer_from_repo, get_model_tokenizer_with_flash_attn, git_clone_github,
-                    register_model)
+                    get_model_tokenizer_from_repo, get_model_tokenizer_with_flash_attn, get_model_with_value_head,
+                    git_clone_github, register_model)
 from .preprocess import (AlpacaPreprocessor, ClsPreprocessor, ComposePreprocessor, ConversationsPreprocessor,
                          PreprocessFunc, RenameColumnsPreprocessor, SmartPreprocessor, SwiftPreprocessor,
                          TextGenerationPreprocessor, preprocess_sharegpt)
@@ -20,10 +20,12 @@ from .protocol import (ChatCompletionMessageToolCall, ChatCompletionRequest, Cha
                        ChatMessage, CompletionRequest, CompletionResponse, CompletionResponseChoice,
                        CompletionResponseStreamChoice, CompletionStreamResponse, DeltaMessage, Function, Model,
                        ModelList, UsageInfo, XRequestConfig, random_uuid)
-from .template import (DEFAULT_SYSTEM, TEMPLATE_MAPPING, History, Prompt, StopWords, Template, TemplateType,
-                       get_template, register_template)
-from .utils import (LazyLLMDataset, LLMDataset, dataset_map, download_dataset, find_all_linears, find_embedding,
-                    find_ln, get_max_model_len, get_time_info, history_to_messages, inference, inference_stream,
+from .template import (DEFAULT_SYSTEM, TEMPLATE_MAPPING, History, KTOTemplateMixin, PPOTemplateMixin, Prompt,
+                       RLHFTemplateMixin, StopWords, Template, TemplateType, get_env_args, get_template,
+                       register_template)
+from .utils import (LazyLLMDataset, LLMDataset, dataset_map, deep_getattr, download_dataset,
+                    dynamic_vit_gradient_checkpointing, find_all_linears, find_embedding, find_ln, get_max_model_len,
+                    get_mllm_arch, get_time_info, history_to_messages, inference, inference_stream,
                     is_lmdeploy_available, is_megatron_available, is_quant_model, is_vllm_available,
                     limit_history_length, messages_join_observation, messages_to_history, print_example,
                     safe_tokenizer_decode, set_generation_config, sort_by_max_length, stat_dataset, to_device)
@@ -33,7 +35,7 @@ logger = get_logger()
 try:
     if is_vllm_available():
         from .vllm_utils import (VllmGenerationConfig, get_vllm_engine, inference_stream_vllm, inference_vllm,
-                                 prepare_vllm_engine_template)
+                                 prepare_vllm_engine_template, add_vllm_request)
         try:
             from .vllm_utils import LoRARequest
         except ImportError:

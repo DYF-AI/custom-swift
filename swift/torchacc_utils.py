@@ -165,8 +165,8 @@ def ta_test_dataloader(test_dataset, data_collator, sampler, args):
 def ta_save_optimizer_and_scheduler(optimizer, lr_scheduler, output_dir):
     import torch_xla.core.xla_model as xm
     xm.rendezvous('saving_optimizer_states')
-    torch.save(optimizer.state_dict(), os.path.join(output_dir, f'optimizer_{xm.get_ordinal()}.pt'))
-    torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, f'scheduler_{xm.get_ordinal()}.pt'))
+    xm.save(optimizer.state_dict(), os.path.join(output_dir, f'optimizer_{xm.get_ordinal()}.pt'), master_only=False)
+    xm.save(lr_scheduler.state_dict(), os.path.join(output_dir, f'scheduler_{xm.get_ordinal()}.pt'), master_only=False)
     xm.rendezvous('saving_optimizer_states_done')
 
 
@@ -188,7 +188,7 @@ def save_ta_ddp_checkpoint(self_model, tokenizer, args, output_dir: Optional[str
 
     model = self_model
 
-    if xm.is_master_ordinal():
+    if xm.is_master_ordinal(local=False):
         os.makedirs(output_dir, exist_ok=True)
         torch.save(args, os.path.join(output_dir, 'training_args.bin'))
 
@@ -277,6 +277,8 @@ def save_ta_fsdp_checkpoint(self_model, tokenizer, args, output_dir):
                 torch.save(full_state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
 
     xm.rendezvous('ckpt_consolidation')
+    # delete the sharded checkpoint.
+    os.remove(ckpt_path)
 
 
 def ta_trim_graph():
@@ -783,3 +785,71 @@ def patch_qwen2_model(model):
 
     model.model.forward = types.MethodType(qwen2_forward, model.model)
     return model
+
+
+def patch_clip_grad_norm(accelerator):
+    import accelerate
+    from accelerate.utils import DistributedType
+    from accelerate.optimizer import AcceleratedOptimizer
+    import torch_xla.core.xla_model as xm
+
+    def clip_grad_norm_(self, parameters, max_norm, norm_type=2):
+        """
+        Should be used in place of `torch.nn.utils.clip_grad_norm_`.
+
+        Returns:
+            `torch.Tensor`: Total norm of the parameter gradients (viewed as a single vector).
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator(gradient_accumulation_steps=2)
+        >>> dataloader, model, optimizer, scheduler = accelerator.prepare(dataloader, model, optimizer, scheduler)
+
+        >>> for input, target in dataloader:
+        ...     optimizer.zero_grad()
+        ...     output = model(input)
+        ...     loss = loss_func(output, target)
+        ...     accelerator.backward(loss)
+        ...     if accelerator.sync_gradients:
+        ...         accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+        ...     optimizer.step()
+        ```
+        """
+        if self.distributed_type == DistributedType.FSDP:
+            self.unscale_gradients()
+            parameters = [p for p in parameters]
+            for model in self._models:
+                if parameters == [p for p in model.parameters()]:
+                    return model.clip_grad_norm_(max_norm, norm_type)
+        elif self.distributed_type == DistributedType.DEEPSPEED:
+            # `accelerator.backward(loss)` is doing that automatically. Therefore, its implementation is not needed
+            # We cannot return the gradient norm because DeepSpeed does it.
+            return None
+        elif self.distributed_type == DistributedType.XLA:
+            # Reduce gradients first for XLA
+            for acc_opt in self._optimizers:
+                if not acc_opt.gradient_state.is_xla_gradients_synced:
+                    opt = acc_opt
+                    while isinstance(opt, AcceleratedOptimizer):
+                        opt = opt.optimizer
+                    gradients = xm._fetch_gradients(opt)
+                    # Use xm.all_reduce to perform an in-place all-reduce. Recusrsive all-reduce each tensor
+                    # one by one in self.reduce is non-inplace.
+                    xm.all_reduce('sum', gradients, scale=1.0 / self.num_processes)
+                    # Set is_xla_gradients_synced to True to avoid all-reduce twice in the AcceleratedOptimizer step.
+                    acc_opt.gradient_state.is_xla_gradients_synced = True
+            if os.environ.get('ACCELERATE_USE_FSDP', 'false') == 'true':
+                self.unscale_gradients()
+                parameters = [p for p in parameters]
+                for model in self._models:
+                    if parameters == [p for p in model.parameters()]:
+                        return model._get_underlay_model().clip_grad_norm_(max_norm, norm_type)
+        self.unscale_gradients()
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type=norm_type)
+
+    # TODO(baole): This should be removed once accelerate is updated.
+    accelerator.clip_grad_norm_ = types.MethodType(clip_grad_norm_, accelerator)
+    return accelerator

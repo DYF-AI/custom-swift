@@ -16,7 +16,6 @@ import transformers
 from datasets import Dataset as HfDataset
 from modelscope import Model, MsDataset, snapshot_download
 from packaging import version
-from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoTokenizer
 
@@ -304,22 +303,30 @@ class TestRun(unittest.TestCase):
             return
         torch.cuda.empty_cache()
         # llm rlhf
-        rlhf_types = ['dpo', 'orpo', 'simpo', 'kto', 'cpo']
+        rlhf_types = ['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo']
         for rlhf_type in rlhf_types:
             dataset_name = 'hh-rlhf-cn-harmless-base-cn' if rlhf_type != 'kto' else 'ultrafeedback-kto'
+            kwargs = {}
+            if rlhf_type == 'ppo':
+                kwargs['reward_model_type'] = 'qwen2-1_5b-instruct'
             output = rlhf_main(
                 RLHFArguments(
                     rlhf_type=rlhf_type,
-                    model_type=ModelType.qwen_1_8b_chat,
+                    model_type=ModelType.qwen2_1_5b_instruct,
                     dataset=dataset_name,
                     train_dataset_sample=100,
-                    eval_steps=5))
-            best_model_checkpoint = output['best_model_checkpoint']
+                    eval_steps=5,
+                    **kwargs))
+            if rlhf_type == 'ppo':
+                model_checkpoint = output['last_model_checkpoint']
+            else:
+                model_checkpoint = output['best_model_checkpoint']
+
             torch.cuda.empty_cache()
-            infer_main(InferArguments(ckpt_dir=best_model_checkpoint, load_dataset_config=True, val_dataset_sample=2))
+            infer_main(InferArguments(ckpt_dir=model_checkpoint, load_dataset_config=True, val_dataset_sample=2))
 
         # mllm rlhf
-        visual_rlhf_types = ['dpo', 'orpo', 'simpo', 'cpo']
+        visual_rlhf_types = ['dpo', 'orpo', 'simpo', 'cpo', 'rm']
         test_model = ['llava1_6-mistral-7b-instruct', 'internvl2-2b',
                       'florence-2-large']  # decoder only and encoder-decoder
         for rlhf_type in visual_rlhf_types:
@@ -380,7 +387,7 @@ class TestRun(unittest.TestCase):
                 lazy_tokenize=False))
 
 
-def data_collate_fn(batch: List[Dict[str, Any]], tokenizer) -> Dict[str, Tensor]:
+def data_collate_fn(batch: List[Dict[str, Any]], tokenizer) -> Dict[str, torch.Tensor]:
     # text-classification
     assert tokenizer.pad_token_id is not None
     input_ids = [torch.tensor(b['input_ids']) for b in batch]
@@ -460,7 +467,7 @@ class TestTrainer(unittest.TestCase):
                 push_to_hub=push_to_hub,
                 hub_token=None,  # use env var
                 hub_private_repo=True,
-                push_hub_strategy='push_best',
+                hub_strategy='every_save',
                 hub_model_id=self.hub_model_id,
                 overwrite_output_dir=True,
                 save_steps=10,

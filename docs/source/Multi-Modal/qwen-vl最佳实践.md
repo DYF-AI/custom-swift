@@ -153,7 +153,8 @@ NPROC_PER_NODE=2 CUDA_VISIBLE_DEVICES=0,1,2,3 swift sft \
 **Qwen-VL**模型支持grounding任务的训练，数据参考下面的格式：
 ```jsonl
 {"query": "Find <bbox>", "response": "<ref-object>", "images": ["/coco2014/train2014/COCO_train2014_000000001507.jpg"], "objects": "[{\"caption\": \"guy in red\", \"bbox\": [138, 136, 235, 359], \"bbox_type\": \"real\", \"image\": 0}]" }
-{"query": "Find <ref-object>", "response": "<bbox>", "images": ["/coco2014/train2014/COCO_train2014_000000001507.jpg"], "objects": "[{\"caption\": \"guy in red\", \"bbox\": [138, 136, 235, 359], \"bbox_type\": \"real\", \"image\": 0}]" }
+# mapping to multiple bboxes
+{"query": "Find <ref-object>", "response": "<bbox>", "images": ["/coco2014/train2014/COCO_train2014_000000001507.jpg"], "objects": "[{\"caption\": \"guy in red\", \"bbox\": [[138, 136, 235, 359],[1,2,3,4]], \"bbox_type\": \"real\", \"image\": 0}]" }
 # 或者使用<img></img>标签
 {"query": "<img>/coco2014/train2014/COCO_train2014_000000001507.jpg</img>Find <bbox>", "response": "<ref-object>", "objects": "[{\"caption\": \"guy in red\", \"bbox\": [138, 136, 235, 359], \"bbox_type\": \"real\", \"image\": 0}]" }
 {"query": "<img>/coco2014/train2014/COCO_train2014_000000001507.jpg</img>Find <ref-object>", "response": "<bbox>", "objects": "[{\"caption\": \"guy in red\", \"bbox\": [138, 136, 235, 359], \"bbox_type\": \"real\", \"image\": 0}]" }
@@ -169,7 +170,7 @@ NPROC_PER_NODE=2 CUDA_VISIBLE_DEVICES=0,1,2,3 swift sft \
 ```
 也可以直接传入上述格式，但是注意坐标请使用千分位坐标。
 
-[自定义数据集](../LLM/自定义与拓展.md#-推荐命令行参数的形式)支持json, jsonl样式, 以下是自定义数据集的例子:
+[自定义数据集](../Instruction/自定义与拓展.md#-推荐命令行参数的形式)支持json, jsonl样式, 以下是自定义数据集的例子:
 
 (支持多轮对话, 支持每轮对话含多张图片或不含图片, 支持传入本地路径或URL)
 

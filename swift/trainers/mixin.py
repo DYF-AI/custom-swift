@@ -5,6 +5,9 @@ import os
 import re
 import shutil
 import time
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
+from copy import copy
 from pathlib import Path
 from types import MethodType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -13,198 +16,38 @@ import json
 import numpy as np
 import safetensors
 import torch
+import torch.nn as nn
 import transformers
 from datasets import Dataset as HfDataset
 from packaging import version
 from peft import PeftModel
 from torch.nn import Module
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, trainer
 from transformers.data.data_collator import DataCollator
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import unwrap_model
-from transformers.trainer import (ADAPTER_CONFIG_NAME, ADAPTER_SAFE_WEIGHTS_NAME, ADAPTER_WEIGHTS_NAME, CONFIG_NAME,
-                                  PREFIX_CHECKPOINT_DIR, SAFE_WEIGHTS_NAME, TRAINER_STATE_NAME, TRAINING_ARGS_NAME,
-                                  WEIGHTS_NAME, IntervalStrategy, Trainer, TrainerCallback, is_peft_available)
+from transformers.trainer import PREFIX_CHECKPOINT_DIR, TRAINER_STATE_NAME, Trainer, TrainerCallback
 from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import TrainingArguments
 from transformers.utils import is_sagemaker_mp_enabled, is_torch_npu_available
 
-from swift.hub import Repository
 from swift.hub.check_model import check_local_model_is_latest
-from swift.torchacc_utils import (save_ta_ddp_checkpoint, save_ta_fsdp_checkpoint, ta_load_optimizer_and_scheduler,
-                                  ta_save_optimizer_and_scheduler, ta_trim_graph)
+from swift.torchacc_utils import (save_ta_ddp_checkpoint, save_ta_fsdp_checkpoint, ta_eval_dataloader,
+                                  ta_load_optimizer_and_scheduler, ta_save_optimizer_and_scheduler, ta_test_dataloader,
+                                  ta_train_dataloader, ta_trim_graph)
 from swift.tuners import SwiftModel
-from swift.utils import check_json_format, create_ms_repo, get_logger, use_torchacc
+from swift.utils import check_json_format, get_logger, use_torchacc
 from swift.utils.constants import Invoke
+from .callback import DefaultFlowCallbackNew, PrinterCallbackNew, ProgressCallbackNew
 from .optimizers.galore import create_optimizer_and_scheduler
 from .utils import can_return_loss, find_labels, get_function, is_instance_of_ms_model
 
+try:
+    from trl import AutoModelForCausalLMWithValueHead
+except (ImportError, RuntimeError):
+    AutoModelForCausalLMWithValueHead = None
+
 logger = get_logger()
-
-
-def _push_to_hub(self: Repository, commit_message: str = 'Commit files to Modelscope Hub', **kwargs):
-    blocking = kwargs.get('blocking', True)
-    self.push(commit_message)
-    if not blocking:
-        # Compatible with transformers
-        return None, None
-    else:
-        return None
-
-
-class PushToMsHubMixin:
-    repo: Repository
-
-    def _add_patterns_to_file(self, file_name: str, patterns: List[str], commit_message: Optional[str] = None) -> None:
-        # Make sure we only do this on the main process
-        if not self.is_world_process_zero():
-            return
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        if commit_message is None:
-            commit_message = f'Add `{patterns[0]}` patterns to {file_name}'
-
-        # Get current file content
-        repo_dir = self.repo.model_dir
-        file_path = os.path.join(repo_dir, file_name)
-        if os.path.exists(file_path):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                current_content = f.read()
-        else:
-            current_content = ''
-        # Add the patterns to file
-        content = current_content
-        for pattern in patterns:
-            if pattern not in content:
-                if len(content) > 0 and not content.endswith('\n'):
-                    content += '\n'
-                content += f'{pattern}\n'
-
-        # Write the file if it has changed
-        if content != current_content:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                logger.debug(f'Writing {file_name} file. Content: {content}')
-                f.write(content)
-        self.repo.push(commit_message)
-
-    def _add_patterns_to_gitignore(self, patterns: List[str], commit_message: Optional[str] = None) -> None:
-        self._add_patterns_to_file('.gitignore', patterns, commit_message)
-
-    def _add_patterns_to_gitattributes(self, patterns: List[str], commit_message: Optional[str] = None) -> None:
-        new_patterns = []
-        suffix = 'filter=lfs diff=lfs merge=lfs -text'
-        for pattern in patterns:
-            if suffix not in pattern:
-                pattern = f'{pattern} {suffix}'
-            new_patterns.append(pattern)
-        file_name = '.gitattributes'
-        if commit_message is None:
-            commit_message = f'Add `{patterns[0]}` patterns to {file_name}'
-        self._add_patterns_to_file(file_name, new_patterns, commit_message)
-
-    def init_hf_repo(self) -> None:
-        """init ms repo. Compatible with transformers>=4.34"""
-        self.init_git_repo(at_init=True)
-
-    def init_git_repo(self, at_init: bool = False) -> None:
-        if not self.is_world_process_zero():
-            return
-        if (os.path.exists(self.args.output_dir) and os.listdir(self.args.output_dir) and self.args.overwrite_output_dir
-                and at_init):
-            # directory not empty.
-            shutil.rmtree(self.args.output_dir)
-        self.args.hub_model_id = create_ms_repo(self.args.hub_model_id, self.args.hub_token, self.args.hub_private_repo)
-        self.repo = Repository(self.args.output_dir, self.args.hub_model_id)
-        self._add_patterns_to_gitattributes(['*.safetensors', '*.bin', '*.pt'])
-        self.repo.push_to_hub = MethodType(_push_to_hub, self.repo)
-        self.repo.local_dir = self.repo.model_dir  # hf compatibility
-
-        # By default, ignore the checkpoint folders
-        if self.args.push_hub_strategy != 'all_checkpoints':
-            self._add_patterns_to_gitignore(['checkpoint-*/', 'tmp-checkpoint-*/'])
-
-        # Add 'runs/' to .gitignore, ignore tensorboard files
-        self._add_patterns_to_gitignore(['runs/'])
-
-        # Add '*.sagemaker' to .gitignore if using SageMaker
-        if os.environ.get('SM_TRAINING_ENV'):
-            self._add_patterns_to_gitignore(['*.sagemaker-uploading', '*.sagemaker-uploaded'],
-                                            'Add `*.sagemaker` patterns to .gitignore')
-
-        self.push_in_progress = None
-
-    def push_to_hub(self, commit_message: str = 'End of training', **kwargs) -> None:
-        # user calls manually `push_to_hub` with `self.args.push_to_hub = False`
-        create_model_card = kwargs.pop('create_model_card', None)
-        if not hasattr(self, 'repo'):
-            self.init_git_repo()
-        self.save_model(_internal_call=True)
-
-        if not self.is_world_process_zero():
-            return
-
-        self.repo.push_to_hub(commit_message, **kwargs)
-        # push separately the model card to be independent from the rest of the model
-        readme_path = os.path.join(self.args.output_dir, 'README.md')
-        if create_model_card is None:
-            create_model_card = not os.path.exists(readme_path)
-        if create_model_card and self.args.should_save:
-            model_name = kwargs.pop('model_name', None)
-            if model_name is None and self.args.should_save:
-                if self.args.hub_model_id is not None:
-                    model_name = self.args.hub_model_id.split('/')[-1]
-                else:
-                    model_name = os.path.basename(self.args.output_dir)
-            self.create_model_card(model_name=model_name, **kwargs)
-            self.repo.push_to_hub('update model card README.md', **kwargs)
-
-    def _push_from_checkpoint(self, checkpoint_folder: str) -> None:
-        """Compatible with transformers>=4.32"""
-        # Only push from one node.
-        if not self.is_world_process_zero() or self.args.push_hub_strategy == 'end':
-            return
-        output_dir = self.args.output_dir
-        # To avoid a new synchronization of all model weights, we just copy the file from the checkpoint folder
-        modeling_files = [CONFIG_NAME, WEIGHTS_NAME, SAFE_WEIGHTS_NAME]
-        if is_peft_available():
-            modeling_files.extend([ADAPTER_CONFIG_NAME, ADAPTER_WEIGHTS_NAME, ADAPTER_SAFE_WEIGHTS_NAME])
-        for modeling_file in modeling_files:
-            if os.path.isfile(os.path.join(checkpoint_folder, modeling_file)):
-                shutil.copy(os.path.join(checkpoint_folder, modeling_file), os.path.join(output_dir, modeling_file))
-        # Saving the tokenizer is fast and we don't know how many files it may have spawned, so we resave it to be sure.
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(output_dir)
-        # Same for the training arguments
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-
-        try:
-            if self.args.push_hub_strategy == 'checkpoint':
-                # Temporarily move the checkpoint just saved for the push
-                tmp_checkpoint = os.path.join(output_dir, 'last-checkpoint')
-                # We have to remove the "last-checkpoint" dir if it exists, otherwise the checkpoint is moved as a
-                # subfolder.
-                if os.path.isdir(tmp_checkpoint):
-                    shutil.rmtree(tmp_checkpoint)
-                shutil.move(checkpoint_folder, tmp_checkpoint)
-
-            if self.args.save_strategy == IntervalStrategy.STEPS:
-                commit_message = f'Training in progress, step {self.state.global_step}'
-            else:
-                commit_message = f'Training in progress, epoch {int(self.state.epoch)}'
-            if self.args.push_hub_strategy == 'push_best':
-                folder, checkpoint_name = os.path.split(checkpoint_folder)
-                checkpoint_name = checkpoint_name.replace('tmp-checkpoint-', 'checkpoint-')
-                last_model_checkpoint = os.path.join(folder, checkpoint_name)
-                if last_model_checkpoint == self.state.best_model_checkpoint:
-                    self.repo.push_to_hub(commit_message=commit_message, blocking=False, auto_lfs_prune=True)
-            else:
-                self.repo.push_to_hub(commit_message=commit_message, blocking=False, auto_lfs_prune=True)
-        except Exception as e:
-            logger.error(f'Error when pushing to hub: {e}')
-        finally:
-            if self.args.push_hub_strategy == 'checkpoint':
-                # Move back the checkpoint to its place
-                shutil.move(tmp_checkpoint, checkpoint_folder)
 
 
 class SwiftMixin:
@@ -239,6 +82,13 @@ class SwiftMixin:
         if is_quantized and use_swift:
             model._hf_peft_config_loaded = True
         self.is_encoder_decoder = kwargs.pop('is_encoder_decoder', False)
+
+        self.sequence_parallel_size = kwargs.pop('sequence_parallel_size', 1)
+        if self.sequence_parallel_size > 1:
+            from swift.trainers.xtuner import init_sequence_parallel_xtuner
+            init_sequence_parallel_xtuner(self.sequence_parallel_size)
+        if not hasattr(self, 'perf'):
+            self.perf = {}
         # mro
         super().__init__(
             model=model,
@@ -253,7 +103,7 @@ class SwiftMixin:
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
             **kwargs)
-        if not self.label_names:
+        if not hasattr(self, 'label_names') or not self.label_names:
             self.label_names = ['labels']
         if is_quantized and use_swift:
             model._hf_peft_config_loaded = _hf_peft_config_loaded
@@ -329,6 +179,30 @@ class SwiftMixin:
 
         ta_save_optimizer_and_scheduler(self.optimizer, self.lr_scheduler, output_dir)
 
+    def _save_initial_model(self, output_dir):
+        model = unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            config = model.peft_config.get('default', {})
+            init_lora_weights = getattr(config, 'init_lora_weights', '')
+            if isinstance(init_lora_weights, str) and ('pissa' in init_lora_weights or 'olora' in init_lora_weights):
+                config.init_lora_weights = True
+                model.save_pretrained(os.path.join(output_dir, 'initial_model'))
+                config.init_lora_weights = init_lora_weights
+
+    def _save_converted_model(self, output_dir):
+        model = unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            config = model.peft_config.get('default', {})
+            init_lora_weights = getattr(config, 'init_lora_weights', '')
+            if isinstance(init_lora_weights, str) and ('pissa' in init_lora_weights or 'olora' in init_lora_weights):
+                config = copy(config)
+                os.makedirs(os.path.join(output_dir, 'converted'), exist_ok=True)
+                model.save_pretrained(
+                    os.path.join(output_dir, 'converted', 'default'),
+                    path_initial_model_for_weight_conversion=os.path.join(os.path.dirname(output_dir), 'initial_model'),
+                )
+                model.peft_config['default'] = config
+
     def _load_optimizer_and_scheduler(self, checkpoint):
         if not (use_torchacc() and self.sft_args.fsdp_num > 1):
             if self._resume_only_model:
@@ -338,7 +212,18 @@ class SwiftMixin:
                 return
             else:
                 # Check if saved optimizer or scheduler states exist
-                return super()._load_optimizer_and_scheduler(checkpoint)
+                super()._load_optimizer_and_scheduler(checkpoint)
+                try:
+                    # fix mp+ddp adamw
+                    for v in self.optimizer.state.values():
+                        if 'step' in v:
+                            # not on the same device
+                            device_set = set([t.device for t in v.values()]) - {v['step'].device, torch.device('cpu')}
+                            if len(device_set) >= 1:
+                                v['step'] = v['step'].to('cpu')
+                except Exception:
+                    pass
+                return
 
         if checkpoint is None or self.args.save_only_model:
             return
@@ -350,11 +235,49 @@ class SwiftMixin:
         if not use_torchacc():
             return super()._save_tpu(output_dir)
 
+        import torch_xla.core.xla_model as xm
+
+        # Compatible with swift and peft
         output_dir = output_dir if output_dir is not None else self.args.output_dir
+
+        if xm.is_master_ordinal(local=False):
+            os.makedirs(output_dir, exist_ok=True)
+            # configuration.json
+            model_dir = getattr(self.model, 'model_dir', None)
+            if model_dir is not None:
+                src_path = os.path.join(model_dir, 'configuration.json')
+                dst_path = os.path.join(output_dir, 'configuration.json')
+                if os.path.exists(src_path):
+                    shutil.copy(src_path, dst_path)
+            else:
+                self._create_configuration_file(self.model, output_dir)
+            self._add_adapter_cfg(output_dir)
+            self._save_sft_args(output_dir)
+            # generation_config
+            generation_config = getattr(self.args, 'generation_config', None)
+            if generation_config is not None:
+                generation_config.save_pretrained(output_dir)
+
+        # model
         if self.sft_args.fsdp_num > 1:
             save_ta_fsdp_checkpoint(self.model, self.tokenizer, self.args, output_dir)
         else:
             save_ta_ddp_checkpoint(self.model, self.tokenizer, self.args, output_dir)
+        sft_args = getattr(self, 'sft_args', None)
+
+        # additional files
+        if xm.is_master_ordinal(local=False):
+            if sft_args is not None and sft_args.sft_type == 'full':
+                additional_files = getattr(self.args, 'additional_saved_files',
+                                           None) or [] + ['preprocessor_config.json']
+                if model_dir is not None:
+                    for file in additional_files:
+                        src_path = os.path.join(model_dir, file)
+                        dst_path = os.path.join(output_dir, file)
+                        if os.path.isfile(src_path):
+                            shutil.copy(src_path, dst_path)
+                        elif os.path.isdir(src_path):
+                            shutil.copytree(src_path, dst_path)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Compatible with swift and peft"""
@@ -377,7 +300,10 @@ class SwiftMixin:
         if generation_config is not None:
             generation_config.save_pretrained(output_dir)
         # model
+
         supported_classes = (SwiftModel, PreTrainedModel, PeftModel)
+        if AutoModelForCausalLMWithValueHead is not None:
+            supported_classes = supported_classes + (AutoModelForCausalLMWithValueHead, )
         save_safetensors = self.args.save_safetensors
 
         if not isinstance(self.model, supported_classes):
@@ -396,6 +322,24 @@ class SwiftMixin:
         elif is_instance_of_ms_model(self.model):
             PreTrainedModel.save_pretrained(
                 self.model, output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
+        elif AutoModelForCausalLMWithValueHead is not None and isinstance(self.model,
+                                                                          AutoModelForCausalLMWithValueHead):
+            # save reward model
+            state_dict = self.model.state_dict()
+            decoder_state_dict, v_head_state_dict = {}, {}
+            for name, param in state_dict.items():
+                if name.startswith('v_head.'):
+                    v_head_state_dict[name] = param
+                else:
+                    decoder_state_dict[name.replace('pretrained_model.', '', 1)] = param
+            self.model.pretrained_model.save_pretrained(
+                output_dir, state_dict=decoder_state_dict or None, safe_serialization=save_safetensors)
+            if save_safetensors:
+                from safetensors.torch import save_file
+                save_file(
+                    v_head_state_dict, os.path.join(output_dir, 'value_head.safetensors'), metadata={'format': 'pt'})
+            else:
+                torch.save(v_head_state_dict, os.path.join(output_dir, 'value_head.bin'))
         else:
             self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
         sft_args = getattr(self, 'sft_args', None)
@@ -417,6 +361,7 @@ class SwiftMixin:
                         shutil.copy(src_path, dst_path)
                     elif os.path.isdir(src_path):
                         shutil.copytree(src_path, dst_path)
+        self._save_converted_model(output_dir)
 
     def _save_checkpoint(self, model, trial, metrics=None):
         self.state.last_model_checkpoint = os.path.join(self.args.output_dir, f'checkpoint-{self.state.global_step}')
@@ -538,6 +483,8 @@ class SwiftMixin:
             resume_from_checkpoint = None
         if self._resume_from_checkpoint is not None and not is_sagemaker_mp_enabled() and not self.is_fsdp_enabled:
             self._load_from_checkpoint(self._resume_from_checkpoint)
+
+        self._save_initial_model(self.args.output_dir)
         res = super().train(resume_from_checkpoint, *args, **kwargs)
         self._resume_from_checkpoint = None
         if self.max_memory != 0:
@@ -667,3 +614,202 @@ class SwiftMixin:
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
         return self.optimizer
+
+    def get_train_dataloader(self):
+        if self.sequence_parallel_size > 1:
+            from swift.trainers.xtuner import get_xtuner_train_dataloader
+            return get_xtuner_train_dataloader(self)
+        elif use_torchacc():
+            if trainer.is_datasets_available():
+                import datasets
+
+            if self.train_dataset is None:
+                raise ValueError('Trainer: training requires a train_dataset.')
+
+            train_dataset = self.train_dataset
+            data_collator = self.data_collator
+
+            if trainer.is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
+                train_dataset = self._remove_unused_columns(train_dataset, description='training')
+            else:
+                data_collator = self._get_collator_with_removed_columns(data_collator, description='training')
+
+            return ta_train_dataloader(train_dataset, data_collator, self._get_train_sampler(), self.args,
+                                       self._train_batch_size)
+        else:
+            return super().get_train_dataloader()
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        if not use_torchacc():
+            return super().get_eval_dataloader(eval_dataset)
+        else:
+            if trainer.is_datasets_available():
+                import datasets
+
+            if eval_dataset is None and self.eval_dataset is None:
+                raise ValueError('Trainer: evaluation requires an eval_dataset.')
+            eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+            data_collator = self.data_collator
+
+            if trainer.is_datasets_available() and isinstance(eval_dataset, datasets.Dataset):
+                eval_dataset = self._remove_unused_columns(eval_dataset, description='evaluation')
+            else:
+                data_collator = self._get_collator_with_removed_columns(data_collator, description='evaluation')
+
+            return ta_eval_dataloader(eval_dataset, data_collator, self._get_eval_sampler(eval_dataset), self.args)
+
+    def get_test_dataloader(self, test_dataset):
+        if not use_torchacc():
+            return super().get_test_dataloader(test_dataset)
+        else:
+            if trainer.is_datasets_available():
+                import datasets
+
+            data_collator = self.data_collator
+
+            if trainer.is_datasets_available() and isinstance(test_dataset, datasets.Dataset):
+                test_dataset = self._remove_unused_columns(test_dataset, description='test')
+            else:
+                data_collator = self._get_collator_with_removed_columns(data_collator, description='test')
+
+            return ta_test_dataloader(test_dataset, data_collator, self._get_eval_sampler(test_dataset), self.args)
+
+
+class ModelWrapper(nn.Module):
+    # compat zero3 & rlhf
+    def __init__(self, model: nn.Module, ref_model: nn.Module):
+        super().__init__()
+        self._model = model
+        self._ref_model = ref_model
+
+    def forward(self, *args, **kwargs):
+        return self._model(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        """Forward missing attributes to the wrapped module."""
+        try:
+            return super().__getattr__(name)  # defer to nn.Module's logic
+        except AttributeError:
+            return getattr(self._model, name)
+
+    def load_state_dict(self, *args, **kwargs):
+        return self._model.load_state_dict(*args, **kwargs)
+
+    def parameters(self, *args, **kwargs):
+        return self._model.parameters(*args, **kwargs)
+
+    @contextmanager
+    def _save_load_context(cls, trainer):
+        # fix zero3 & save/load model
+        deepspeed_model = trainer.deepspeed
+        _new_model = deepspeed_model._model
+        _old_model = deepspeed_model.__dict__['module']
+        deepspeed_model.__dict__['module'] = _new_model
+        deepspeed_model._modules['module'] = _new_model
+        trainer.model = _new_model
+        yield
+        deepspeed_model.__dict__['module'] = _old_model
+        deepspeed_model._modules['module'] = _old_model
+        trainer.model = deepspeed_model
+
+
+class RLHFTrainerMixin:
+
+    @staticmethod
+    def get_model_config_attr(config, key):
+        for k in [None, 'language_config', 'llm_config', 'text_config']:
+            if k is None:
+                llm_config = config
+            else:
+                llm_config = getattr(config, k, None)
+            if llm_config:
+                val = getattr(llm_config, key)
+                if val is not None:
+                    return val
+
+    def __init__(self,
+                 model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
+                 ref_model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
+                 *_args,
+                 **kwargs):
+        from trl.trainer import disable_dropout_in_model
+        self.ref_model = ref_model
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+        args = kwargs['args']
+        self.beta = getattr(args, 'beta', 0.0)
+        if getattr(args, 'disable_dropout', False):
+            disable_dropout_in_model(model)
+            if self.ref_model is not None:
+                disable_dropout_in_model(self.ref_model)
+
+        self.is_encoder_decoder = kwargs['is_encoder_decoder']
+        self.aux_loss_enabled = getattr(model.config, 'output_router_logits', False)
+        self._peft_has_been_casted_to_bf16 = False
+        self.generate_during_eval = getattr(args, 'generate_during_eval', False)
+        self.is_multimodal = False
+        if self.is_encoder_decoder:
+            self.decoder_start_token_id = self.get_model_config_attr(model.config, 'decoder_start_token_id')
+            self.pad_token_id = self.get_model_config_attr(model.config, 'pad_token_id')
+        # not use
+        self.is_vision_model = False
+        tokenizer = kwargs['tokenizer']
+        self.label_pad_token_id = -100
+        self.padding_value = tokenizer.pad_token_id
+        self.use_dpo_data_collator = True
+        if is_deepspeed_zero3_enabled() and ref_model is not None:
+            model = ModelWrapper(model, ref_model)
+        super().__init__(model, *_args, **kwargs)
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        context = nullcontext()
+        if hasattr(model, '_save_load_context'):
+            context = model._save_load_context(self)
+        with context:
+            return super()._save_checkpoint(model, trial, metrics)
+
+    def concatenated_forward(
+        self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+
+        model_kwargs = batch.copy()
+        labels = model_kwargs.pop('labels', None)
+        if self.is_encoder_decoder:
+            model_kwargs['labels'] = labels
+
+        if self.aux_loss_enabled:
+            model_kwargs['output_router_logits'] = True
+        outputs = model(**model_kwargs, use_cache=False)
+        model_kwargs['labels'] = labels
+        model_kwargs['chosen_labels'] = torch.zeros(model_kwargs['input_ids'].shape[0] // 2)  # just get shape
+        if outputs.logits.shape[1] != labels.shape[1]:
+            # for llava, the model returns logits for the entire sequence, including the image tokens
+            # (placed before the text tokens)
+            outputs.logits = outputs.logits[:, -labels.shape[1]:]
+        for key in ['input_ids', 'attention_mask', 'labels']:
+            model_kwargs[f'concatenated_{key}'] = model_kwargs.pop(key)
+        if self.__class__.__name__ == 'ORPOTrainer':  # Pass-through labels
+            model_kwargs['concatenated_input_ids'] = model_kwargs['concatenated_labels']
+
+        @contextmanager
+        def _patch_concatenated_forward():
+            _old_concatenated_inputs = self.concatenated_inputs
+            _old_model_call = model.__class__.__call__
+            self.concatenated_inputs = lambda *args, **kwargs: model_kwargs
+            model.__class__.__call__ = lambda *args, **kwargs: outputs
+            yield
+            self.concatenated_inputs = _old_concatenated_inputs
+            model.__class__.__call__ = _old_model_call
+
+        with _patch_concatenated_forward():
+            return super().concatenated_forward(model, model_kwargs)
+
+    def get_batch_logps(self, logits: torch.FloatTensor, labels: torch.LongTensor, *args, **kwargs):
+        if self.is_encoder_decoder:
+            labels = labels.clone()  # fix trl bug
+        return super().get_batch_logps(logits, labels, *args, **kwargs)
+
+
+# monkey patching
+trainer.DEFAULT_PROGRESS_CALLBACK = ProgressCallbackNew
+trainer.DEFAULT_CALLBACKS = [DefaultFlowCallbackNew]
+trainer.PrinterCallback = PrinterCallbackNew

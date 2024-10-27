@@ -1,21 +1,9 @@
-import dataclasses
 from collections import OrderedDict
-from typing import Optional, Union
+from dataclasses import dataclass, field
+from typing import List, Union
 
 
-@dataclasses.dataclass
-class MultiModelKeys:
-
-    language_model: str = None
-
-    projector: Optional[str] = None
-
-    vision_tower: str = None
-
-    vision_resampler: str = None
-
-
-@dataclasses.dataclass
+@dataclass
 class ModelKeys:
 
     model_type: str = None
@@ -51,6 +39,23 @@ class ModelKeys:
     kvb_proj: str = None
 
     output: str = None
+
+
+@dataclass
+class MultiModelKeys(ModelKeys):
+    language_model: Union[List[str], str] = field(default_factory=list)
+    connector: Union[List[str], str] = field(default_factory=list)
+    vision_tower: Union[List[str], str] = field(default_factory=list)
+    generator: Union[List[str], str] = field(default_factory=list)
+
+    def __post_init__(self):
+        # compat
+        for key in ['language_model', 'connector', 'vision_tower', 'generator']:
+            v = getattr(self, key)
+            if isinstance(v, str):
+                setattr(self, key, [v])
+            if v is None:
+                setattr(self, key, [])
 
 
 LLAMA_KEYS = ModelKeys(
@@ -183,100 +188,143 @@ DEEPSEEK_V2_KEYS = ModelKeys(
 
 LLAVA_KEYS = MultiModelKeys(
     language_model='language_model',
-    projector='multi_modal_projector',
+    connector='multi_modal_projector',
     vision_tower='vision_tower',
 )
 
 LLAVA_NEXT_VIDEO_KEYS = MultiModelKeys(
     language_model='language_model',
-    projector='multi_modal_projector',
+    connector=['multi_modal_projector', 'vision_resampler'],
     vision_tower='vision_tower',
-    vision_resampler='vision_resampler',
 )
 
 LLAVA_LLAMA_KEYS = MultiModelKeys(
     language_model='model.layers',
-    projector='model.mm_projector',
+    connector='model.mm_projector',
     vision_tower='model.vision_tower',
 )
 
 INTERNLM_XCOMPOSER_KEYS = MultiModelKeys(
     language_model='model',
-    projector='vision_proj',
+    connector='vision_proj',
     vision_tower='vit',
 )
 
 INTERNVL_KEYS = MultiModelKeys(
     language_model='language_model',
-    projector='mlp1',
+    connector='mlp1',
+    vision_tower='vision_model',
+)
+
+MPLUG_OWL3_KEYS = MultiModelKeys(
+    language_model='language_model',
+    connector='vision2text_model',
     vision_tower='vision_model',
 )
 
 DEEPSEEK_VL_KEYS = MultiModelKeys(
     language_model='language_model',
-    projector='aligner',
+    connector='aligner',
     vision_tower='vision_model',
 )
 
 MINICPM_V_KEYS = MultiModelKeys(
     language_model='llm',
-    projector='resampler',
+    connector='resampler',
     vision_tower='vpm',
 )
 
 PHI3V_KEYS = MultiModelKeys(
     language_model='model.layers',
-    projector='model.vision_embed_tokens.img_projection',
+    connector='model.vision_embed_tokens.img_projection',
     vision_tower='model.vision_embed_tokens.img_processor',
 )
 
 COGVLM_KEYS = MultiModelKeys(
     language_model='model.layers',
-    projector=None,
     vision_tower='model.vision',
 )
 
 FLORENCE_KEYS = MultiModelKeys(
     language_model='language_model',
-    projector='image_projection',
+    connector='image_projection',
     vision_tower='vision_tower',
 )
 
 QWEN_VL_KEYS = MultiModelKeys(
     language_model='transformer.h',
-    projector=None,
     vision_tower='transformer.visual',
 )
 
 QWEN_AUDIO_KEYS = MultiModelKeys(
     language_model='transformer.h',
-    projector=None,
     vision_tower='transformer.audio',
 )
 
 QWEN2_AUDIO_KEYS = MultiModelKeys(
     language_model='language_model',
-    projector='multi_modal_projector',
+    connector='multi_modal_projector',
     vision_tower='audio_tower',
+)
+
+QWEN2_VL_KEYS = MultiModelKeys(
+    language_model='model',
+    vision_tower='visual',
 )
 
 GLM4V_KEYS = MultiModelKeys(
     language_model='transformer.encoder',
-    projector=None,
     vision_tower='transformer.vision',
 )
 
 IDEFICS3_KEYS = MultiModelKeys(
     language_model='model.text_model',
-    projector='model.connector',
+    connector='model.connector',
     vision_tower='model.vision_model',
 )
+
+LLAMA3_1_OMNI = MultiModelKeys(
+    language_model='model.layers',
+    connector='model.speech_projector',
+    vision_tower='model.speech_encoder',
+    generator='speech_generator',
+)
+
+GOT_OCR2 = MultiModelKeys(
+    language_model='model.layers',
+    connector='model.mm_projector_vary',
+    vision_tower='model.vision_tower_high',
+)
+
+LLAMA3_2_VISION = MultiModelKeys(
+    language_model='language_model',
+    connector='multi_modal_projector',
+    vision_tower='vision_model',
+)
+
+OVIS1_6 = MultiModelKeys(
+    language_model='llm',
+    vision_tower='visual_tokenizer',
+)
+
+MOLMO_KEYS = MultiModelKeys(
+    language_model='model.transformer',
+    vision_tower='model.vision_backbone',
+)
+DEEPSPEED_JANUS = MultiModelKeys(
+    language_model='language_model',
+    vision_tower='vision_model',
+    connector='aligner',
+    generator=['gen_vision_model', 'gen_aligner', 'gen_head', 'gen_embed'])
+
+EMU3_CHAT_KEYS = MultiModelKeys(language_model='model', )
 
 MODEL_KEYS_MAPPING = OrderedDict([
     # MLLM here
     ('qwen_audio', QWEN_AUDIO_KEYS),
     ('qwen_vl', QWEN_VL_KEYS),
     ('qwen2_audio', QWEN2_AUDIO_KEYS),
+    ('qwen2_vl', QWEN2_VL_KEYS),
     ('glm4v', GLM4V_KEYS),
     ('llava_next_video', LLAVA_NEXT_VIDEO_KEYS),
     ('llava_llama', LLAVA_LLAMA_KEYS),
@@ -289,6 +337,14 @@ MODEL_KEYS_MAPPING = OrderedDict([
     ('cogvlm', COGVLM_KEYS),
     ('florence', FLORENCE_KEYS),
     ('idefics3', IDEFICS3_KEYS),
+    ('mplug_owl3', MPLUG_OWL3_KEYS),
+    ('llama3_1_omni', LLAMA3_1_OMNI),
+    ('got_ocr2', GOT_OCR2),
+    ('llama3_2_vision', LLAMA3_2_VISION),
+    ('ovis1_6', OVIS1_6),
+    ('molmo', MOLMO_KEYS),
+    ('deepseek_janus', DEEPSPEED_JANUS),
+    ('emu3_chat', EMU3_CHAT_KEYS),
     # LLM begins here
     ('llama', LLAMA_KEYS),
     ('mistral', LLAMA_KEYS),
@@ -296,9 +352,9 @@ MODEL_KEYS_MAPPING = OrderedDict([
     ('qwen2', LLAMA_KEYS),
     ('yi', LLAMA_KEYS),
     ('gemma', LLAMA_KEYS),
-    ('internlm2', LLAMA_KEYS),
+    ('internlm2', INTERNLM2_KEYS),
     ('internlm', LLAMA_KEYS),
-    ('deepseek-v2', LLAMA_KEYS),
+    ('deepseek-v2', DEEPSEEK_V2_KEYS),
     ('deepseek', LLAMA_KEYS),
     ('openbuddy', LLAMA_KEYS),
     ('xverse', LLAMA_KEYS),
@@ -306,15 +362,15 @@ MODEL_KEYS_MAPPING = OrderedDict([
     ('bluelm', LLAMA_KEYS),
     ('ziya', LLAMA_KEYS),
     ('skywork', LLAMA_KEYS),
-    ('chatglm', LLAMA_KEYS),
-    ('glm4', LLAMA_KEYS),
-    ('baichuan', LLAMA_KEYS),
-    ('yuan', LLAMA_KEYS),
-    ('codefuse', LLAMA_KEYS),
-    ('phi2', LLAMA_KEYS),
-    ('qwen', LLAMA_KEYS),
-    ('phi3-small', LLAMA_KEYS),
-    ('phi3', LLAMA_KEYS),
+    ('chatglm', CHATGLM_KEYS),
+    ('glm4', CHATGLM_KEYS),
+    ('baichuan', BAICHUAN_KEYS),
+    ('yuan', YUAN_KEYS),
+    ('codefuse', CODEFUSE_KEYS),
+    ('phi2', PHI2_KEYS),
+    ('qwen', QWEN_KEYS),
+    ('phi3-small', PHI3_SMALL_KEYS),
+    ('phi3', PHI3_KEYS),
     ('minicpm', LLAMA_KEYS),
 ])
 
@@ -329,9 +385,12 @@ def get_regex_for_mm_default_lora(model_type: str):
     if not isinstance(mapping, MultiModelKeys):
         return None
     llm = mapping.language_model
-    projector = mapping.projector
-    _regex = f'^({llm}'
-    if projector:
-        _regex += f'|{projector}'
-    _regex += ')(?!.*(lm_head|output|emb|wte|shared)).*'
-    return _regex
+    connector = mapping.connector
+    assert isinstance(llm, (list, tuple)) and isinstance(connector,
+                                                         (list, tuple)), f'llm: {llm}, connector: {connector}'
+    _regex = []
+    for module in llm + connector:
+        _regex.append(f'{module}')
+    regex = '|'.join(_regex)
+    regex = f'^({regex})(?!.*(lm_head|output|emb|wte|shared)).*'
+    return regex
