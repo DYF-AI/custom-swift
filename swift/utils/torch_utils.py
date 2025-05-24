@@ -1,24 +1,29 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-
+import gc
 import hashlib
 import os
 import pickle
+import re
 import time
 import uuid
 from bisect import bisect_right
 from contextlib import contextmanager, nullcontext
-from typing import Dict, List, Optional, Tuple, Union
+from datetime import timedelta
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from datasets.utils.filelock import FileLock
 from modelscope.hub.utils.utils import get_cache_dir
-from torch.nn import Linear, Module
 from transformers.integrations import is_deepspeed_zero3_enabled
+from transformers.trainer_utils import set_seed
+from transformers.utils import is_torch_cuda_available, is_torch_mps_available, is_torch_npu_available
 
-from .env import get_dist_setting
+from .env import get_dist_setting, is_dist, is_dist_ta, is_local_master, is_master
 from .logger import get_logger
+from .utils import deep_getattr
 
 logger = get_logger()
 
@@ -43,7 +48,7 @@ def get_n_params_grads(model) -> Tuple[List[int], List[int]]:
     return n_params, n_grads
 
 
-def get_model_parameter_info(model: Module, name: Optional[str] = None) -> str:
+def get_model_parameter_info(model: nn.Module, name: Optional[str] = None) -> str:
     n_params, n_grads = get_n_params_grads(model)
     n_params = sum(n_params)
     n_grads = sum(n_grads)
@@ -72,7 +77,7 @@ def find_sub_module(module: torch.nn.Module, module_name: str) -> List[torch.nn.
     return _modules
 
 
-def show_layers(model: Module, max_lines: Optional[int] = 20) -> None:
+def show_layers(model: nn.Module, max_lines: Optional[int] = 20) -> None:
     named_p = list(model.named_parameters())
     for i, (n, p) in enumerate(named_p):
         if max_lines is not None and i >= max_lines:
@@ -81,7 +86,10 @@ def show_layers(model: Module, max_lines: Optional[int] = 20) -> None:
         logger.info(f'[{n}]: requires_grad={p.requires_grad}, dtype={p.dtype}, device={p.device}')
 
 
-def freeze_parameters(model: Module, freeze_parameters_ratio: float, freeze_parameters: List[str]) -> None:
+def freeze_parameters(model: nn.Module,
+                      freeze_parameters_ratio: float,
+                      freeze_parameters: List[str],
+                      freeze_parameters_regex: Optional[str] = None) -> None:
     if freeze_parameters_ratio > 0:
         n_parameters = get_n_params_grads(model)[0]
         n_parameters = np.array(n_parameters, dtype=np.int64)
@@ -97,19 +105,48 @@ def freeze_parameters(model: Module, freeze_parameters_ratio: float, freeze_para
                 if n.startswith(freeze_p):
                     p.requires_grad = False
 
+    if freeze_parameters_regex is not None:
+        try:
+            pattern = re.compile(freeze_parameters_regex)
+        except re.error as e:
+            logger.warning(f"Invalid freeze_parameters_regex '{freeze_parameters_regex}': {e}")
+            return
 
-def activate_parameters(model: Module, additional_trainable_parameters: List[str]) -> None:
-    if len(additional_trainable_parameters) == 0:
-        return
+        for n, p in model.named_parameters():
+            if pattern.search(n):
+                p.requires_grad = False
+
+
+def activate_parameters(model: nn.Module,
+                        additional_trainable_parameters: List[str],
+                        trainable_parameters_regex: Optional[str] = None) -> None:
     has_activate = False
-    for n, p in model.named_parameters():
-        for additional_tp in additional_trainable_parameters:
-            if n.startswith(additional_tp):
+    if len(additional_trainable_parameters) > 0:
+        for n, p in model.named_parameters():
+            for additional_tp in additional_trainable_parameters:
+                if n.startswith(additional_tp):
+                    p.requires_grad = True
+                    has_activate = True
+        if not has_activate:
+            logger.warning('len(additional_trainable_parameters) > 0 but no parameters are activated. '
+                           f'additional_trainable_parameters: {additional_trainable_parameters}')
+
+    has_activate = False
+    if trainable_parameters_regex is not None:
+        try:
+            pattern = re.compile(trainable_parameters_regex)
+        except re.error as e:
+            logger.warning(f"Invalid trainable_parameters_regex '{trainable_parameters_regex}': {e}")
+            return
+
+        for n, p in model.named_parameters():
+            if pattern.search(n):
                 p.requires_grad = True
                 has_activate = True
-    if not has_activate:
-        logger.warning('len(additional_trainable_parameters) > 0 but no parameters are activated. '
-                       f'additional_trainable_parameters: {additional_trainable_parameters}')
+
+        if not has_activate:
+            logger.warning('trainable_parameters_regex is provided but no parameters are activated. '
+                           f'trainable_parameters_regex: {trainable_parameters_regex}')
 
 
 def time_synchronize() -> float:
@@ -126,7 +163,7 @@ def _get_max_memory(device_ids: List[int]) -> Dict[Union[int, str], int]:
 
     device_ids_set = set(device_ids)
     max_memory = {}
-    for i in range(torch.cuda.device_count()):
+    for i in range(get_device_count()):
         max_memory[i] = 0
         if i in device_ids_set:
             max_memory[i] = torch.cuda.mem_get_info(i)[0]
@@ -151,85 +188,162 @@ def _sync_max_memory(max_memory: Dict[Union[int, str], int]) -> Dict[Union[int, 
     return new_max_memory
 
 
-def _find_layers(model: Module, module_cls: type) -> List[str]:
-    module_names = set()
+def find_layers(
+    model: nn.Module,
+    cond: Callable[[str, nn.Module], bool],
+    sub_module: Optional[str] = None,
+    min_name_len: Optional[int] = None,
+) -> List[str]:
+    # The content of target_module_names cannot exist in inner_nodes.
+    sub_module_str = sub_module
+    if sub_module is None:
+        sub_module = model
+    else:
+        sub_module = deep_getattr(model, sub_module)
+    inner_nodes = set()
     for name, module in model.named_modules():
-        if isinstance(module, module_cls):
-            module_name = '.'.join(name.split('.')[-2:])
-            module_names.add(module_name)
-    return list(module_names)
+        name = re.sub(r'\d+\.', '{}.', name)
+        if not cond(name, module):
+            inner_nodes.add(name)
+    target_module_names = set()
+    for name, module in sub_module.named_modules():
+        if sub_module_str:
+            name = f'{sub_module_str}.{name}' if name else sub_module_str
+        if cond(name, module):
+            module_name_list = name.split('.')
+            module_name = module_name_list.pop()
+            i = 1
+            for inner_node in inner_nodes:
+                while module_name_list and inner_node.endswith(re.sub(
+                        r'\d+\.', '{}.', module_name)) or min_name_len and i < min_name_len:
+                    module_name = f'{module_name_list.pop()}.{module_name}'
+                    i += 1
+            target_module_names.add(module_name)
+    return list(target_module_names)
 
 
-def find_embedding(model: Module) -> List[str]:
-    return _find_layers(model, torch.nn.Embedding)
+def find_norm(model: nn.Module) -> List[str]:
+    # find_layer_norm
+    return find_layers(
+        model,
+        lambda name, module: isinstance(module, torch.nn.LayerNorm) or 'rmsnorm' in module.__class__.__name__.lower())
 
 
-def find_all_linears(model: Module) -> List[str]:
-    """ref: https://github.com/artidoro/qlora"""
-    from swift.llm import get_model_arch
-    model_info = model.model_info
-    model_arch = get_model_arch(model.model_meta.model_arch)
+def find_embedding(model: nn.Module) -> List[str]:
+    return find_layers(model, lambda name, module: isinstance(module, torch.nn.Embedding))
+
+
+def find_all_linears(model, model_arch=None, extra_layers=None, sub_module=None):
+    if model_arch is None:
+        from swift.llm import get_model_arch
+        model_arch = get_model_arch(model.model_meta.model_arch)
+    # lm_head
     if model_arch and model_arch.lm_head:
         output = model_arch.lm_head
         idx = output.rfind('.')
         lm_head_name = output[idx + 1:]
     else:
         lm_head_name = 'lm_head'
+    # 'score', 'classifier': classification model
+    # 'v_head': reward model
+    ignore_layers = [lm_head_name, 'score', 'v_head', 'classifier'] + ['lora_A', 'lora_B', 'base_layer']
+    ignore_linear_cls = [
+        'glulinear'  # phi4-mm
+    ]
 
-    quant_method = model_info.quant_method
-    quant_bits = model_info.quant_bits
-    if quant_method == 'bnb':
-        from bitsandbytes.nn import Linear4bit, Linear8bitLt
-        if quant_bits == 4:
-            linear_cls = [Linear4bit]
-        elif quant_bits == 8:
-            linear_cls = [Linear8bitLt]
-    elif quant_method == 'hqq':
-        from hqq.core.quantize import HQQLinear
-        linear_cls = [HQQLinear]
-    elif quant_method == 'eetq':
-        from eetq import EetqLinear
-        linear_cls = [EetqLinear]
-    elif quant_method == 'gptq':
-        from peft.utils import get_auto_gptq_quant_linear, get_quantization_config
-        gptq_quantization_config = get_quantization_config(model, 'gptq')
-        AutoGPTQQuantLinear = get_auto_gptq_quant_linear(gptq_quantization_config)
-        linear_cls = [AutoGPTQQuantLinear]
-    elif quant_method == 'awq':
-        from awq.modules.linear import WQLinear_GEMM
-        linear_cls = [WQLinear_GEMM]
-    elif quant_method == 'aqlm':
-        from aqlm import QuantizedLinear
-        linear_cls = [QuantizedLinear]
-    else:
-        linear_cls = [Linear]
+    def _cond(name, module):
+        module_name = module.__class__.__name__.lower()
+        if (extra_layers and isinstance(module, tuple(extra_layers)) or
+            ('linear' in module_name and all(linear_cls not in module_name
+                                             for linear_cls in ignore_linear_cls))) and all(layer not in name
+                                                                                            for layer in ignore_layers):
+            return True
+        return False
 
-    # The content of target_module_names cannot exist in inner_nodes.
-    # O(n^2logn), n represents the number of nodes, n<1000.
-    inner_nodes = set()
-    for name, module in model.named_modules():
-        if not isinstance(module, tuple(linear_cls)):
-            inner_nodes.add(name)
-    target_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, tuple(linear_cls)) and lm_head_name not in name and 'score' not in name:
-            module_name_list = name.split('.')
-            module_name = module_name_list.pop()
-            for inner_node in inner_nodes:
-                while inner_node.endswith(module_name):
-                    module_name = f'{module_name_list.pop()}.{module_name}'
-            target_module_names.add(module_name)
-    return list(target_module_names)
+    return find_layers(model, _cond, sub_module=sub_module)
 
 
 @contextmanager
-def safe_ddp_context(hash_id: str):
-    lock_dir = os.path.join(get_cache_dir(), 'lockers')
-    os.makedirs(lock_dir, exist_ok=True)
-    file_path = hashlib.sha256(hash_id.encode('utf-8')).hexdigest() + '.lock'
-    file_path = os.path.join(lock_dir, file_path)
-    with FileLock(file_path):
+def safe_ddp_context(hash_id: Optional[str], use_barrier: bool = False):
+    if use_barrier and dist.is_initialized():
+        if is_dist() or is_dist_ta():
+            if not is_master():
+                dist.barrier()
+            if not is_local_master():
+                # Compatible with multi-machine scenarios,
+                # where each machine uses different storage hardware.
+                dist.barrier()
         yield
+        if is_dist() or is_dist_ta():
+            if is_master():
+                dist.barrier()
+            if is_local_master():
+                dist.barrier()
+    elif hash_id is not None:
+        lock_dir = os.path.join(get_cache_dir(), 'lockers')
+        os.makedirs(lock_dir, exist_ok=True)
+        file_path = hashlib.sha256(hash_id.encode('utf-8')).hexdigest() + '.lock'
+        file_path = os.path.join(lock_dir, file_path)
+        with FileLock(file_path):
+            yield
+    else:
+        yield
+
+
+def get_device(local_rank: Optional[Union[str, int]] = None) -> str:
+    if local_rank is None:
+        local_rank = max(0, get_dist_setting()[1])
+    local_rank = str(local_rank)
+    if is_torch_npu_available():
+        device = 'npu:{}'.format(local_rank)
+    elif is_torch_mps_available():
+        device = 'mps:{}'.format(local_rank)
+    elif is_torch_cuda_available():
+        device = 'cuda:{}'.format(local_rank)
+    else:
+        device = 'cpu'
+
+    return device
+
+
+def get_current_device():
+    if is_torch_npu_available():
+        current_device = torch.npu.current_device()
+    elif is_torch_cuda_available():
+        current_device = torch.cuda.current_device()
+    elif is_torch_mps_available():
+        current_device = 'mps'
+    else:
+        current_device = 'cpu'
+    return current_device
+
+
+def set_device(local_rank: Optional[Union[str, int]] = None):
+    if local_rank is None:
+        local_rank = max(0, get_dist_setting()[1])
+    if is_torch_npu_available():
+        torch.npu.set_device(local_rank)
+    elif is_torch_cuda_available():
+        torch.cuda.set_device(local_rank)
+
+
+def get_device_count() -> int:
+    if is_torch_npu_available():
+        return torch.npu.device_count()
+    elif is_torch_cuda_available():
+        return torch.cuda.device_count()
+    else:
+        return 0
+
+
+def gc_collect() -> None:
+    gc.collect()
+    if is_torch_npu_available():
+        torch.npu.empty_cache()
+    elif is_torch_mps_available():
+        torch.mps.empty_cache()
+    elif is_torch_cuda_available():
+        torch.cuda.empty_cache()
 
 
 class Serializer:
@@ -250,3 +364,40 @@ class Serializer:
         buffer_size = np.frombuffer(res[:8], dtype=np.int64)[0]
         res = res[8:]
         return pickle.loads(res[:buffer_size])
+
+
+def set_default_ddp_config():
+    # It runs normally with Python as well.
+    rank = int(os.getenv('RANK', -1))
+    if rank == -1:
+        os.environ['NPROC_PER_NODE'] = '1'
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        os.environ['LOCAL_WORLD_SIZE'] = '1'
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29500')
+
+
+def init_process_group(backend: Optional[str] = None, timeout: int = 18000000):
+    if dist.is_initialized():
+        return
+    set_device()
+    if backend is None:
+        if is_torch_npu_available():
+            backend = 'hccl'
+        elif torch.cuda.is_available():
+            backend = 'nccl'
+        else:
+            backend = 'gloo'
+    timeout = timedelta(seconds=timeout)
+    dist.init_process_group(backend=backend, timeout=timeout)
+
+
+def seed_worker(worker_id: int, num_workers: int, rank: int):
+    """
+    Helper function to set worker seed during Dataloader initialization.
+    """
+    init_seed = torch.initial_seed() % 2**32
+    worker_seed = num_workers * rank + init_seed
+    set_seed(worker_seed)

@@ -8,7 +8,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 def infer(client, model: str, messages):
-    resp = client.chat.completions.create(model=model, messages=messages, temperature=0)
+    resp = client.chat.completions.create(model=model, messages=messages, max_tokens=512, temperature=0)
     query = messages[0]['content']
     response = resp.choices[0].message.content
     print(f'query: {query}')
@@ -93,5 +93,5 @@ def run_client(host: str = '127.0.0.1', port: int = 8000):
 
 if __name__ == '__main__':
     from swift.llm import run_deploy, DeployArguments
-    with run_deploy(DeployArguments(model='Qwen/Qwen2-VL-2B-Instruct', verbose=False, log_interval=-1)) as port:
+    with run_deploy(DeployArguments(model='Qwen/Qwen2.5-VL-3B-Instruct', verbose=False, log_interval=-1)) as port:
         run_client(port=port)

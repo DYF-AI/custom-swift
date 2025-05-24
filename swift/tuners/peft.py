@@ -18,10 +18,12 @@ from peft import (AdaLoraConfig, BOFTConfig, BOFTModel, LoftQConfig, LoHaConfig,
                   PromptEncoderConfig, PromptLearningConfig, PromptTuningConfig, VeraConfig, VeraModel, get_peft_config,
                   get_peft_model, get_peft_model_state_dict)
 from peft.config import PeftConfigMixin
+from peft.tuners import lora
+from peft.tuners.adalora import AdaLoraModel, RankAllocator
 from peft.tuners.lora import Embedding
 from transformers import Trainer
 
-from swift import get_logger
+from swift.utils import get_logger
 
 try:
     from peft import FourierFTModel
@@ -42,7 +44,7 @@ class LoraConfig(peft.LoraConfig):
     lora_dtype: Optional[str] = field(
         default=None, metadata={'help': 'The lora dtype, default None means following the original layer\'s dtype'})
 
-    lorap_lr_ratio: Optional[float] = field(default=2.0**4, metadata={'help': 'The lr ratio of lora_B in lora+'})
+    lorap_lr_ratio: Optional[float] = field(default=None, metadata={'help': 'The lr ratio of lora_B in lora+'})
 
     lorap_emb_lr: float = field(default=1e-6, metadata={'help': 'The lr for embedding in lora+'})
 
@@ -60,7 +62,7 @@ class LoraConfig(peft.LoraConfig):
             'lorap_lr_ratio': self.lorap_lr_ratio,
             'lorap_emb_lr': self.lorap_emb_lr,
         }
-        with open(os.path.join(save_directory, 'additional_config.json'), 'w') as f:
+        with open(os.path.join(save_directory, 'additional_config.json'), 'w', encoding='utf-8') as f:
             json.dump(additional_args, f)
 
     @classmethod
@@ -74,7 +76,8 @@ class LoraConfig(peft.LoraConfig):
             self = LoraConfig(**self.to_dict())
 
         if os.path.isfile(os.path.join(pretrained_model_name_or_path, 'additional_config.json')):
-            with open(os.path.join(pretrained_model_name_or_path, 'additional_config.json'), 'r') as f:
+            with open(
+                    os.path.join(pretrained_model_name_or_path, 'additional_config.json'), 'r', encoding='utf-8') as f:
                 _json = json.load(f)
                 for key, value in _json.items():
                     setattr(self, key, value)
@@ -84,7 +87,7 @@ class LoraConfig(peft.LoraConfig):
 
 def _create_and_replace_hook(self, peft_config, adapter_name, target, *args, **kwargs):
     all_supported_names = ('linear', )
-    all_supported_types = (torch.nn.Embedding, torch.nn.Conv2d, transformers.pytorch_utils.Conv1D)
+    all_supported_types = (torch.nn.Embedding, torch.nn.Conv2d, transformers.pytorch_utils.Conv1D, lora.Linear)
     target_modules = getattr(peft_config, 'target_modules', None)
     if target is None:
         return
@@ -281,6 +284,8 @@ def hot_patch_peft_module():
     # Fix Lora does not support NonDynamicallyQuantizableLinear
     LoraModel._create_and_replace_origin = LoraModel._create_and_replace
     LoraModel._create_and_replace = _create_and_replace_hook
+    AdaLoraModel._create_and_replace_origin = AdaLoraModel._create_and_replace
+    AdaLoraModel._create_and_replace = _create_and_replace_hook
     VeraModel._create_and_replace_origin = VeraModel._create_and_replace
     VeraModel._create_and_replace = _create_and_replace_hook
     BOFTModel._create_and_replace_origin = BOFTModel._create_and_replace
@@ -296,17 +301,19 @@ def hot_patch_peft_module():
     def __new_init__(self, model: torch.nn.Module, config: Dict[str, LoraConfig], adapter_name: str):
 
         self.__init_origin__(model, config, adapter_name)
-        if isinstance(self.active_adapter, list):
-            self.active_adapter = self.active_adapter[0]
-        active_config = config[self.active_adapter] if isinstance(config, dict) else config
-        if hasattr(active_config, 'lora_dtype'):
-            for name, module in model.named_modules():
-                if isinstance(module, LoraLayer):
-                    _convert_dtype(module, self.active_adapter, active_config.lora_dtype)
-                    for lora in list(module.lora_A.values()) + list(module.lora_B.values()):
-                        if not hasattr(lora, 'forward_origin'):
-                            lora.forward_origin = lora.forward
-                            lora.forward = MethodType(keep_device_forward, lora)
+        active_adapters = self.active_adapter
+        if isinstance(active_adapters, str):
+            active_adapters = [active_adapters]
+        for active_adapter in active_adapters:
+            active_config = config[active_adapter] if isinstance(config, dict) else config
+            if hasattr(active_config, 'lora_dtype'):
+                for name, module in model.named_modules():
+                    if isinstance(module, LoraLayer):
+                        _convert_dtype(module, active_adapter, active_config.lora_dtype)
+                        for lora in list(module.lora_A.values()) + list(module.lora_B.values()):
+                            if not hasattr(lora, 'forward_origin'):
+                                lora.forward_origin = lora.forward
+                                lora.forward = MethodType(keep_device_forward, lora)
 
     LoraModel.__init_origin__ = LoraModel.__init__
     LoraModel.__init__ = __new_init__
@@ -326,7 +333,6 @@ def hot_patch_peft_module():
     PeftModel.set_active_adapters = partial(dummy_function, func='set_active_adapters')
 
     # Fix adalora does not support device_map
-    from peft.tuners.adalora import AdaLoraModel, RankAllocator
     AdaLoraModel.forward = adalora_forward
     RankAllocator.mask_to_budget = adalora_mask_to_budget
 
@@ -350,6 +356,7 @@ def get_wrapped_class(module_class):
             return module_class.from_pretrained(model, model_id, *args, **kwargs)
 
     PeftWrapper.__name__ = module_class.__name__
+    PeftWrapper.__qualname__ = module_class.__qualname__
     return PeftWrapper
 
 

@@ -25,6 +25,7 @@ class MLLMModelArch:
     qwen_audio = 'qwen_audio'
     qwen2_vl = 'qwen2_vl'
     qwen2_audio = 'qwen2_audio'
+    qwen2_5_omni = 'qwen2_5_omni'
 
     cogvlm = 'cogvlm'
     glm4v = 'glm4v'
@@ -32,6 +33,7 @@ class MLLMModelArch:
 
     llama3_1_omni = 'llama3_1_omni'
     llama3_2_vision = 'llama3_2_vision'
+    llama4 = 'llama4'
 
     llava_hf = 'llava_hf'
     llava_next_video_hf = 'llava_next_video_hf'
@@ -39,24 +41,33 @@ class MLLMModelArch:
     llava_llama = 'llava_llama'
     llava_mistral = 'llava_mistral'
 
-    internlm_xcomposer = 'internlm_xcomposer'
+    xcomposer = 'xcomposer'
     internvl = 'internvl'
     minicpmv = 'minicpmv'
     deepseek_vl = 'deepseek_vl'
+    deepseek_vl2 = 'deepseek_vl2'
+    deepseek_janus = 'deepseek_janus'
 
     mplug_owl2 = 'mplug_owl2'
     mplug_owl2_1 = 'mplug_owl2_1'
     mplug_owl3 = 'mplug_owl3'
+    doc_owl2 = 'doc_owl2'
 
-    phi3v = 'phi3v'
+    phi3_vision = 'phi3_vision'
+    phi4_multimodal = 'phi4_multimodal'
     florence = 'florence'
     idefics3 = 'idefics3'
 
     got_ocr2 = 'got_ocr2'
+    got_ocr2_hf = 'got_ocr2_hf'
+
     ovis1_6 = 'ovis1_6'
     molmo = 'molmo'
-    janus = 'janus'
     emu3_chat = 'emu3_chat'
+    megrez_omni = 'megrez_omni'
+    valley = 'valley'
+    gemma3_vision = 'gemma3_vision'
+    mistral_2503 = 'mistral_2503'
 
 
 class ModelArch(LLMModelArch, MLLMModelArch):
@@ -330,7 +341,7 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
-        MLLMModelArch.internlm_xcomposer,
+        MLLMModelArch.xcomposer,
         language_model='model',
         aligner='vision_proj',
         vision_tower='vit',
@@ -354,10 +365,34 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
+        MLLMModelArch.doc_owl2,
+        language_model='model.layers',
+        aligner=['model.vision2text', 'model.hr_compressor'],
+        vision_tower='model.vision_model',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
         MLLMModelArch.deepseek_vl,
         language_model='language_model',
         aligner='aligner',
         vision_tower='vision_model',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.deepseek_janus,
+        language_model='language_model',
+        vision_tower='vision_model',
+        aligner='aligner',
+        generator=['gen_vision_model', 'gen_aligner', 'gen_head', 'gen_embed']))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.deepseek_vl2,
+        language_model='language',
+        vision_tower='vision',
+        aligner='projector',
     ))
 
 register_model_arch(
@@ -370,10 +405,23 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
-        MLLMModelArch.phi3v,
+        MLLMModelArch.phi3_vision,
         language_model='model.layers',
         aligner='model.vision_embed_tokens.img_projection',
         vision_tower='model.vision_embed_tokens.img_processor',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.phi4_multimodal,
+        language_model='model.layers',
+        aligner=[
+            'model.embed_tokens_extend.image_embed.img_projection',
+            'model.embed_tokens_extend.audio_embed.audio_projection'
+        ],
+        vision_tower=[
+            'model.embed_tokens_extend.image_embed.img_processor', 'model.embed_tokens_extend.audio_embed.encoder'
+        ],
     ))
 
 register_model_arch(MultiModelKeys(
@@ -417,6 +465,14 @@ register_model_arch(
         language_model='model',
         aligner='visual.merger',
         vision_tower='visual',
+    ))
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.qwen2_5_omni,
+        language_model='thinker.model',
+        vision_tower=['thinker.audio_tower', 'thinker.visual'],
+        aligner=['thinker.audio_tower.proj', 'thinker.visual.merger'],
+        generator=['talker', 'token2wav'],
     ))
 
 register_model_arch(
@@ -470,21 +526,35 @@ register_model_arch(
         MLLMModelArch.molmo,
         language_model='model.transformer',
         vision_tower='model.vision_backbone',
-    ))
+        aligner='model.vision_backbone.image_projector'))
 
 register_model_arch(
     MultiModelKeys(
-        MLLMModelArch.janus,
-        language_model='language_model',
-        vision_tower='vision_model',
-        aligner='aligner',
-        generator=['gen_vision_model', 'gen_aligner', 'gen_head', 'gen_embed']))
+        MLLMModelArch.megrez_omni,
+        language_model='llm',
+        vision_tower=['vision', 'audio'],
+    ))
 
 register_model_arch(MultiModelKeys(MLLMModelArch.emu3_chat, language_model='model'))
 
 register_model_arch(
     MultiModelKeys(MLLMModelArch.glm_edge_v, language_model='model.layers', vision_tower='model.vision'))
 
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.valley,
+        language_model='model',
+        vision_tower=['model.vision_tower', 'model.qwen2vl_vision_tower'],
+    ))
 
-def get_model_arch(arch_name: Optional[str]) -> Optional[ModelKeys]:
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.gemma3_vision,
+        language_model='language_model',
+        aligner='multi_modal_projector',
+        vision_tower='vision_tower',
+    ))
+
+
+def get_model_arch(arch_name: Optional[str]) -> Optional[MultiModelKeys]:
     return MODEL_ARCH_MAPPING.get(arch_name)

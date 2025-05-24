@@ -6,6 +6,7 @@ from typing import Any, Dict
 from transformers import AutoConfig
 
 from swift.llm import TemplateType
+from swift.utils import get_device
 from ..constant import LLMModelType, MLLMModelType
 from ..model_arch import ModelArch
 from ..register import (Model, ModelGroup, ModelMeta, get_model_tokenizer_multimodal,
@@ -40,7 +41,7 @@ register_model(
                     Model('modelscope/Llama-2-13b-chat-ms', 'meta-llama/Llama-2-13b-chat-hf'),
                     Model('modelscope/Llama-2-70b-chat-ms', 'meta-llama/Llama-2-70b-chat-hf'),
                 ],
-                ignore_file_pattern=[r'.+\.bin$']),
+                ignore_patterns=[r'.+\.bin$']),
             # chinese-llama2
             ModelGroup([
                 # base
@@ -176,7 +177,7 @@ register_model(
         TemplateType.llama3_2,
         get_model_tokenizer_with_flash_attn,
         architectures=['LlamaForCausalLM'],
-        requires=['transformers>=4.45'],
+        requires=['transformers>=4.43'],
         model_arch=ModelArch.llama,
     ))
 
@@ -207,6 +208,35 @@ register_model(
     ))
 
 
+def get_model_tokenizer_llama4(*args, **kwargs):
+    from transformers import Llama4ForConditionalGeneration
+    kwargs['automodel_class'] = kwargs['automodel_class'] or Llama4ForConditionalGeneration
+    return get_model_tokenizer_multimodal(*args, **kwargs)
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.llama4,
+        [
+            ModelGroup([
+                Model('LLM-Research/Llama-4-Scout-17B-16E', 'meta-llama/Llama-4-Scout-17B-16E'),
+                Model('LLM-Research/Llama-4-Maverick-17B-128E', 'meta-llama/Llama-4-Maverick-17B-128E'),
+                Model('LLM-Research/Llama-4-Scout-17B-16E-Instruct', 'meta-llama/Llama-4-Scout-17B-16E-Instruct'),
+                Model('LLM-Research/Llama-4-Maverick-17B-128E-Instruct-FP8',
+                      'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8'),
+                Model('LLM-Research/Llama-4-Maverick-17B-128E-Instruct',
+                      'meta-llama/Llama-4-Maverick-17B-128E-Instruct'),
+            ])
+        ],
+        TemplateType.llama4,
+        get_model_tokenizer_llama4,
+        requires=['transformers>=4.51'],
+        architectures=['Llama4ForConditionalGeneration'],
+        model_arch=ModelArch.llama3_2_vision,
+        tags=['vision'],
+    ))
+
+
 def get_model_tokenizer_omnli(model_dir: str,
                               model_info: ModelInfo,
                               model_kwargs: Dict[str, Any],
@@ -215,7 +245,7 @@ def get_model_tokenizer_omnli(model_dir: str,
     local_repo_path = kwargs.get('local_repo_path')
     if not local_repo_path:
         local_repo_path = git_clone_github('https://github.com/ictnlp/LLaMA-Omni')
-    sys.path.append(os.path.join(local_repo_path))
+    sys.path.append(local_repo_path)
     from omni_speech.model import OmniSpeech2SLlamaForCausalLM, OmniSpeechLlamaForCausalLM
     import whisper
     model_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -235,7 +265,7 @@ def get_model_tokenizer_omnli(model_dir: str,
     model_kwargs['device_map'] = None
     model, tokenizer = get_model_tokenizer_with_flash_attn(model_dir, model_info, model_kwargs, load_model, **kwargs)
     if model:
-        model.to('cuda:0' if device_map == 'auto' else device_map)
+        model.to(get_device() if device_map == 'auto' else device_map)
     return model, tokenizer
 
 
@@ -249,7 +279,7 @@ register_model(
         get_model_tokenizer_omnli,
         architectures=['OmniSpeech2SLlamaForCausalLM'],
         model_arch=ModelArch.llama3_1_omni,
-        requires=['whisper', 'openai-whisper'],
+        requires=['openai-whisper'],
         tags=['audio'],
     ))
 
@@ -322,6 +352,20 @@ register_model(
             ]),
         ],
         TemplateType.ziya,
+        get_model_tokenizer_with_flash_attn,
+        model_arch=ModelArch.llama,
+        architectures=['LlamaForCausalLM'],
+    ))
+
+register_model(
+    ModelMeta(
+        LLMModelType.megrez,
+        [
+            ModelGroup([
+                Model('InfiniAI/Megrez-3b-Instruct', 'Infinigence/Megrez-3B-Instruct'),
+            ]),
+        ],
+        TemplateType.megrez,
         get_model_tokenizer_with_flash_attn,
         model_arch=ModelArch.llama,
         architectures=['LlamaForCausalLM'],

@@ -1,13 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import datetime as dt
 import os
-from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from dataclasses import dataclass
+from typing import Literal, Optional, Union
 
 import torch.distributed as dist
 
-from swift.llm import LoRARequest, get_template_meta
-from swift.utils import get_logger, is_dist
+from swift.utils import get_logger, init_process_group, is_dist
 from .base_args import BaseArguments, to_abspath
 from .base_args.model_args import ModelArguments
 from .merge_args import MergeArguments
@@ -36,13 +35,16 @@ class LmdeployArguments:
     vision_batch_size: int = 1  # max_batch_size in VisionConfig
 
     def get_lmdeploy_engine_kwargs(self):
-        return {
+        kwargs = {
             'tp': self.tp,
             'session_len': self.session_len,
             'cache_max_entry_count': self.cache_max_entry_count,
             'quant_policy': self.quant_policy,
             'vision_batch_size': self.vision_batch_size
         }
+        if dist.is_initialized():
+            kwargs.update({'devices': [dist.get_rank()]})
+        return kwargs
 
 
 @dataclass
@@ -60,7 +62,7 @@ class VllmArguments:
         enforce_eager (bool): Flag to enforce eager execution. Default is False.
         limit_mm_per_prompt (Optional[str]): Limit multimedia per prompt. Default is None.
         vllm_max_lora_rank (int): Maximum LoRA rank. Default is 16.
-        lora_modules (List[str]): List of LoRA modules. Default is an empty list.
+        enable_prefix_caching (bool): Flag to enable automatic prefix caching. Default is False.
     """
     # vllm
     gpu_memory_utilization: float = 0.9
@@ -70,16 +72,22 @@ class VllmArguments:
     max_model_len: Optional[int] = None
     disable_custom_all_reduce: bool = False
     enforce_eager: bool = False
-    limit_mm_per_prompt: Optional[str] = None  # '{"image": 10, "video": 5}'
+    limit_mm_per_prompt: Optional[Union[dict, str]] = None  # '{"image": 5, "video": 2}'
     vllm_max_lora_rank: int = 16
-
-    lora_modules: List[str] = field(default_factory=list)
+    enable_prefix_caching: bool = False
+    use_async_engine: bool = True
+    data_parallel_size: int = 1
+    log_level: Literal['critical', 'error', 'warning', 'info', 'debug', 'trace'] = 'info'
+    vllm_quantization: Optional[str] = None
 
     def __post_init__(self):
         self.limit_mm_per_prompt = ModelArguments.parse_to_dict(self.limit_mm_per_prompt)
 
     def get_vllm_engine_kwargs(self):
-        return {
+        adapters = self.adapters
+        if hasattr(self, 'adapter_mapping'):
+            adapters = adapters + list(self.adapter_mapping.values())
+        kwargs = {
             'gpu_memory_utilization': self.gpu_memory_utilization,
             'tensor_parallel_size': self.tensor_parallel_size,
             'pipeline_parallel_size': self.pipeline_parallel_size,
@@ -89,9 +97,14 @@ class VllmArguments:
             'enforce_eager': self.enforce_eager,
             'limit_mm_per_prompt': self.limit_mm_per_prompt,
             'max_lora_rank': self.vllm_max_lora_rank,
-            'enable_lora': len(self.lora_modules) > 0,
-            'max_loras': max(len(self.lora_modules), 1),
+            'enable_lora': len(adapters) > 0,
+            'max_loras': max(len(adapters), 1),
+            'enable_prefix_caching': self.enable_prefix_caching,
+            'quantization': self.vllm_quantization,
         }
+        if dist.is_initialized():
+            kwargs.update({'device': dist.get_rank()})
+        return kwargs
 
 
 @dataclass
@@ -108,11 +121,10 @@ class InferArguments(MergeArguments, VllmArguments, LmdeployArguments, BaseArgum
         max_batch_size (int): Maximum batch size for the pt engine. Default is 1.
         val_dataset_sample (Optional[int]): Sample size for validation dataset. Default is None.
     """
-    ckpt_dir: Optional[str] = field(default=None, metadata={'help': '/path/to/your/vx-xxx/checkpoint-xxx'})
     infer_backend: Literal['vllm', 'pt', 'lmdeploy'] = 'pt'
 
     result_path: Optional[str] = None
-    writer_buffer_size: int = 65536
+    metric: Literal['acc', 'rouge'] = None
     # for pt engine
     max_batch_size: int = 1
 
@@ -129,6 +141,7 @@ class InferArguments(MergeArguments, VllmArguments, LmdeployArguments, BaseArgum
 
     def _init_result_path(self, folder_name: str) -> None:
         if self.result_path is not None:
+            self.result_path = to_abspath(self.result_path)
             return
         self.result_path = self._get_result_path(folder_name)
         logger.info(f'args.result_path: {self.result_path}')
@@ -136,34 +149,25 @@ class InferArguments(MergeArguments, VllmArguments, LmdeployArguments, BaseArgum
     def _init_stream(self):
         self.eval_human = not (self.dataset and self.split_dataset_ratio > 0 or self.val_dataset)
 
-        if self.stream and self.template:
-            template_meta = get_template_meta(self.template)
-            if self.num_beams != 1 or not template_meta.support_stream:
-                self.stream = False
-                logger.info('Setting args.stream: False')
+        if self.stream and self.num_beams != 1:
+            self.stream = False
+            logger.info('Setting args.stream: False')
 
-    def _init_pt_ddp(self):
-        if self.infer_backend != 'pt' or not is_dist():
+    def _init_ddp(self):
+        if not is_dist():
             return
-        assert not self.eval_human and not self.stream
+        assert not self.eval_human and not self.stream, (
+            f'args.eval_human: {self.eval_human}, args.stream: {self.stream}')
         self._init_device()
-        if not dist.is_initialized():
-            dist.init_process_group(backend='nccl')
+        init_process_group(backend=self.ddp_backend, timeout=self.ddp_timeout)
 
     def __post_init__(self) -> None:
-        if self.ckpt_dir:
-            self.ckpt_dir = to_abspath(self.ckpt_dir, True)
-            self.load_args_from_ckpt(self.ckpt_dir)
-        self._init_weight_type(self.ckpt_dir)
         BaseArguments.__post_init__(self)
-        MergeArguments.__post_init__(self)
         VllmArguments.__post_init__(self)
-        self._parse_lora_modules()
-
         self._init_result_path('infer_result')
         self._init_eval_human()
         self._init_stream()
-        self._init_pt_ddp()
+        self._init_ddp()
 
     def _init_eval_human(self):
         if len(self.dataset) == 0 and len(self.val_dataset) == 0:
@@ -172,14 +176,3 @@ class InferArguments(MergeArguments, VllmArguments, LmdeployArguments, BaseArgum
             eval_human = False
         self.eval_human = eval_human
         logger.info(f'Setting args.eval_human: {self.eval_human}')
-
-    def _parse_lora_modules(self) -> None:
-        if len(self.lora_modules) == 0:
-            self.lora_request_list = []
-            return
-        assert self.infer_backend in {'vllm', 'pt'}
-        lora_request_list = []
-        for i, lora_module in enumerate(self.lora_modules):
-            lora_name, lora_path = lora_module.split('=')
-            lora_request_list.append(LoRARequest(lora_name, lora_path))
-        self.lora_request_list = lora_request_list

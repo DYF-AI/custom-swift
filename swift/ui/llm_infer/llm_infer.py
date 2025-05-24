@@ -1,6 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import os
 import re
+import signal
 import sys
 import time
 from copy import deepcopy
@@ -12,12 +13,13 @@ import gradio as gr
 import json
 import torch
 from json import JSONDecodeError
+from transformers.utils import is_torch_cuda_available, is_torch_npu_available
 
 from swift.llm import DeployArguments, InferArguments, InferClient, InferRequest, RequestConfig
 from swift.ui.base import BaseUI
 from swift.ui.llm_infer.model import Model
 from swift.ui.llm_infer.runtime import Runtime
-from swift.utils import get_logger
+from swift.utils import get_device_count, get_logger
 
 logger = get_logger()
 
@@ -26,11 +28,7 @@ class LLMInfer(BaseUI):
 
     group = 'llm_infer'
 
-    is_gradio_app = False
-
     is_multimodal = True
-
-    deployed = False
 
     sub_ui = [Model, Runtime]
 
@@ -59,12 +57,6 @@ class LLMInfer(BaseUI):
                 'en': 'Start to deploy model, '
                 'please Click "Show running '
                 'status" to view details',
-            }
-        },
-        'load_alert_gradio_app': {
-            'value': {
-                'zh': '部署中，请查看部署日志',
-                'en': 'Start to deploy model, please check the log',
             }
         },
         'loaded_alert': {
@@ -132,23 +124,19 @@ class LLMInfer(BaseUI):
     @classmethod
     def do_build_ui(cls, base_tab: Type['BaseUI']):
         with gr.TabItem(elem_id='llm_infer', label=''):
-            gpu_count = 0
             default_device = 'cpu'
-            if torch.cuda.is_available():
-                gpu_count = torch.cuda.device_count()
+            device_count = get_device_count()
+            if device_count > 0:
                 default_device = '0'
             with gr.Blocks():
                 infer_request = gr.State(None)
-                if LLMInfer.is_gradio_app:
-                    Model.visible = False
-                    Runtime.visible = False
                 Model.build_ui(base_tab)
                 Runtime.build_ui(base_tab)
-                with gr.Row(visible=not LLMInfer.is_gradio_app):
+                with gr.Row():
                     gr.Dropdown(
                         elem_id='gpu_id',
                         multiselect=True,
-                        choices=[str(i) for i in range(gpu_count)] + ['cpu'],
+                        choices=[str(i) for i in range(device_count)] + ['cpu'],
                         value=default_device,
                         scale=8)
                     infer_model_type = gr.Textbox(elem_id='infer_model_type', scale=4)
@@ -156,7 +144,7 @@ class LLMInfer(BaseUI):
                 chatbot = gr.Chatbot(elem_id='chatbot', elem_classes='control-height')
                 with gr.Row():
                     prompt = gr.Textbox(elem_id='prompt', lines=1, interactive=True)
-                    with gr.Tabs(visible=not cls.is_gradio_app or cls.is_multimodal):
+                    with gr.Tabs(visible=cls.is_multimodal):
                         with gr.TabItem(label='Image'):
                             image = gr.Image(type='filepath')
                         with gr.TabItem(label='Video'):
@@ -168,10 +156,9 @@ class LLMInfer(BaseUI):
                     clear_history = gr.Button(elem_id='clear_history')
                     submit = gr.Button(elem_id='submit')
 
-                if not LLMInfer.is_gradio_app:
-                    cls.element('load_checkpoint').click(
-                        cls.deploy_model, list(base_tab.valid_elements().values()),
-                        [cls.element('runtime_tab'), cls.element('running_tasks')])
+                cls.element('load_checkpoint').click(
+                    cls.deploy_model, list(base_tab.valid_elements().values()),
+                    [cls.element('runtime_tab'), cls.element('running_tasks')])
                 submit.click(
                     cls.send_message,
                     inputs=[
@@ -190,17 +177,14 @@ class LLMInfer(BaseUI):
                 clear_history.click(
                     fn=cls.clear_session, inputs=[], outputs=[prompt, chatbot, image, video, audio, infer_request])
 
-                if not LLMInfer.is_gradio_app:
-                    base_tab.element('running_tasks').change(
-                        partial(Runtime.task_changed, base_tab=base_tab), [base_tab.element('running_tasks')],
-                        list(cls.valid_elements().values()) + [cls.element('log')],
-                        cancels=Runtime.log_event)
-                    Runtime.element('kill_task').click(
-                        Runtime.kill_task,
-                        [Runtime.element('running_tasks')],
-                        [Runtime.element('running_tasks')] + [Runtime.element('log')],
-                        cancels=[Runtime.log_event],
-                    )
+                base_tab.element('running_tasks').change(
+                    partial(Runtime.task_changed, base_tab=base_tab), [base_tab.element('running_tasks')],
+                    list(cls.valid_elements().values()) + [cls.element('log')])
+                Runtime.element('kill_task').click(
+                    Runtime.kill_task,
+                    [Runtime.element('running_tasks')],
+                    [Runtime.element('running_tasks')] + [Runtime.element('log')],
+                )
 
     @classmethod
     def deploy(cls, *args):
@@ -236,7 +220,7 @@ class LLMInfer(BaseUI):
         model = kwargs.get('model')
         if os.path.exists(model) and os.path.exists(os.path.join(model, 'args.json')):
             kwargs['ckpt_dir'] = kwargs.pop('model')
-            with open(os.path.join(kwargs['ckpt_dir'], 'args.json'), 'r') as f:
+            with open(os.path.join(kwargs['ckpt_dir'], 'args.json'), 'r', encoding='utf-8') as f:
                 _json = json.load(f)
                 kwargs['model_type'] = _json['model_type']
                 kwargs['train_type'] = _json['train_type']
@@ -266,7 +250,12 @@ class LLMInfer(BaseUI):
         gpus = ','.join(devices)
         cuda_param = ''
         if gpus != 'cpu':
-            cuda_param = f'CUDA_VISIBLE_DEVICES={gpus}'
+            if is_torch_npu_available():
+                cuda_param = f'ASCEND_RT_VISIBLE_DEVICES={gpus}'
+            elif is_torch_cuda_available():
+                cuda_param = f'CUDA_VISIBLE_DEVICES={gpus}'
+            else:
+                cuda_param = ''
         now = datetime.now()
         time_str = f'{now.year}{now.month}{now.day}{now.hour}{now.minute}{now.second}'
         file_path = f'output/{deploy_args.model_type}-{time_str}'
@@ -286,22 +275,24 @@ class LLMInfer(BaseUI):
 
     @classmethod
     def deploy_model(cls, *args):
-        if cls.is_gradio_app:
-            if cls.deployed:
-                return gr.update(), gr.update()
         run_command, deploy_args, log_file = cls.deploy(*args)
         logger.info(f'Running deployment command: {run_command}')
         os.system(run_command)
-        if cls.is_gradio_app:
-            gr.Info(cls.locale('load_alert_gradio_app', cls.lang)['value'])
-        else:
-            gr.Info(cls.locale('load_alert', cls.lang)['value'])
+        gr.Info(cls.locale('load_alert', cls.lang)['value'])
         time.sleep(2)
-        cls.deployed = True
         running_task = Runtime.refresh_tasks(log_file)
-        if cls.is_gradio_app:
-            cls.running_task = running_task['value']
         return gr.update(open=True), running_task
+
+    @classmethod
+    def register_clean_hook(cls):
+        signal.signal(signal.SIGINT, LLMInfer.signal_handler)
+        if os.name != 'nt':
+            signal.signal(signal.SIGTERM, LLMInfer.signal_handler)
+
+    @staticmethod
+    def signal_handler(*args, **kwargs):
+        LLMInfer.clean_deployment()
+        sys.exit(0)
 
     @classmethod
     def clear_session(cls):
@@ -367,8 +358,6 @@ class LLMInfer(BaseUI):
         else:
             infer_request.messages[-1]['content'] = infer_request.messages[-1]['content'] + prompt
 
-        if cls.is_gradio_app:
-            running_task = cls.running_task
         _, args = Runtime.parse_info_from_cmdline(running_task)
         request_config = RequestConfig(
             temperature=temperature, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty)
@@ -393,13 +382,15 @@ class LLMInfer(BaseUI):
         model_kwargs = {}
         if infer_model_type:
             model_kwargs = {'model': infer_model_type}
-        stream_resp = InferClient(
+        gen_list = InferClient(
             port=args['port'], ).infer(
                 infer_requests=[_infer_request], request_config=request_config, **model_kwargs)
         if infer_request.messages[-1]['role'] != 'assistant':
             infer_request.messages.append({'role': 'assistant', 'content': ''})
-        for chunk in stream_resp:
-            stream_resp_with_history += chunk[0].choices[0].delta.content if chat else chunk.choices[0].text
+        for chunk in gen_list[0]:
+            if chunk is None:
+                continue
+            stream_resp_with_history += chunk.choices[0].delta.content if chat else chunk.choices[0].text
             infer_request.messages[-1]['content'] = stream_resp_with_history
             yield '', cls._replace_tag_with_media(infer_request), gr.update(value=None), gr.update(
                 value=None), gr.update(value=None), infer_request

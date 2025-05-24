@@ -8,7 +8,7 @@ from typing import List, Literal, Optional, Union
 
 import huggingface_hub
 from huggingface_hub import RepoUrl
-from huggingface_hub.hf_api import CommitInfo, api, future_compatible
+from huggingface_hub.hf_api import api, future_compatible
 from requests.exceptions import HTTPError
 from transformers import trainer
 from transformers.utils import logging, strtobool
@@ -101,7 +101,7 @@ class HubOperation:
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
                        download_model: bool = True,
-                       ignore_file_pattern: Optional[List[str]] = None,
+                       ignore_patterns: Optional[List[str]] = None,
                        **kwargs):
         """Download model from the hub
 
@@ -110,7 +110,7 @@ class HubOperation:
             revision: The model revision
             download_model: Whether downloading bin/safetensors files, this is usually useful when only
                 using tokenizer
-            ignore_file_pattern: Custom ignore pattern
+            ignore_patterns: Custom ignore pattern
             **kwargs:
 
         Returns:
@@ -122,13 +122,8 @@ class HubOperation:
 class MSHub(HubOperation):
     ms_token = None
 
-    @classmethod
-    def create_repo(cls,
-                    repo_id: str,
-                    *,
-                    token: Union[str, bool, None] = None,
-                    private: bool = False,
-                    **kwargs) -> RepoUrl:
+    @staticmethod
+    def create_repo(repo_id: str, *, token: Union[str, bool, None] = None, private: bool = False, **kwargs) -> RepoUrl:
         """
         Create a new repository on the hub.
 
@@ -141,13 +136,13 @@ class MSHub(HubOperation):
         Returns:
             RepoUrl: The URL of the created repository.
         """
-        hub_model_id = cls.create_model_repo(repo_id, token, private)
+        hub_model_id = MSHub.create_model_repo(repo_id, token, private)
         return RepoUrl(url=hub_model_id, )
 
-    @classmethod
+    @staticmethod
     @future_compatible
     def upload_folder(
-        cls,
+        self,
         *,
         repo_id: str,
         folder_path: Union[str, Path],
@@ -159,8 +154,9 @@ class MSHub(HubOperation):
         ignore_patterns: Optional[Union[List[str], str]] = None,
         **kwargs,
     ):
-        cls.push_to_hub(repo_id, folder_path, path_in_repo, commit_message, commit_description, token, True, revision,
-                        ignore_patterns)
+        from modelscope.utils.repo_utils import CommitInfo
+        MSHub.push_to_hub(repo_id, folder_path, path_in_repo, commit_message, commit_description, token, True, revision,
+                          ignore_patterns)
         return CommitInfo(
             commit_url=f'https://www.modelscope.cn/models/{repo_id}/files',
             commit_message=commit_message,
@@ -201,6 +197,7 @@ class MSHub(HubOperation):
 
     @classmethod
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False) -> str:
+        from modelscope import HubApi
         from modelscope.hub.api import ModelScopeConfig
         from modelscope.hub.constants import ModelVisibility
         assert repo_id is not None, 'Please enter a valid hub_model_id'
@@ -209,7 +206,7 @@ class MSHub(HubOperation):
             raise ValueError('Please specify a token by `--hub_token` or `MODELSCOPE_API_TOKEN=xxx`')
         cls.ms_token = token
         visibility = ModelVisibility.PRIVATE if private else ModelVisibility.PUBLIC
-
+        api = HubApi()
         if '/' not in repo_id:
             user_name = ModelScopeConfig.get_user_info()[0]
             assert isinstance(user_name, str)
@@ -255,7 +252,7 @@ class MSHub(HubOperation):
         if commit_description:
             commit_message = commit_message + '\n' + commit_description
         if not os.path.exists(os.path.join(folder_path, 'configuration.json')):
-            with open(os.path.join(folder_path, 'configuration.json'), 'w') as f:
+            with open(os.path.join(folder_path, 'configuration.json'), 'w', encoding='utf-8') as f:
                 f.write('{"framework": "pytorch", "task": "text-generation", "allow_remote": true}')
         if ignore_patterns:
             ignore_patterns = [p for p in ignore_patterns if p != '_*']
@@ -290,20 +287,21 @@ class MSHub(HubOperation):
         cls.try_login(token)
         if revision is None or revision == 'main':
             revision = 'master'
-        # noinspection PyTypeChecker
+
         return MsDataset.load(
             dataset_id,
             subset_name=subset_name,
             split=split,
             version=revision,
             download_mode=download_mode,
-            use_streaming=streaming)
+            use_streaming=streaming,
+        )
 
     @classmethod
     def download_model(cls,
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
-                       ignore_file_pattern: Optional[List[str]] = None,
+                       ignore_patterns: Optional[List[str]] = None,
                        token: Optional[str] = None,
                        **kwargs):
         cls.try_login(token)
@@ -311,7 +309,7 @@ class MSHub(HubOperation):
             revision = 'master'
         logger.info(f'Downloading the model from ModelScope Hub, model_id: {model_id_or_path}')
         from modelscope import snapshot_download
-        return snapshot_download(model_id_or_path, revision, ignore_file_pattern=ignore_file_pattern, **kwargs)
+        return snapshot_download(model_id_or_path, revision, ignore_patterns=ignore_patterns, **kwargs)
 
     @staticmethod
     def add_patterns_to_file(repo,
@@ -379,7 +377,7 @@ class HFHub(HubOperation):
 
     @classmethod
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False) -> str:
-        return api.create_model(repo_id, token=token, private=private)
+        return api.create_repo(repo_id, token=token, private=private)
 
     @classmethod
     def push_to_hub(cls,
@@ -397,7 +395,7 @@ class HFHub(HubOperation):
         if revision is None or revision == 'master':
             revision = 'main'
         return api.upload_folder(
-            repo_id,
+            repo_id=repo_id,
             folder_path=folder_path,
             path_in_repo=path_in_repo,
             commit_message=commit_message,
@@ -433,7 +431,7 @@ class HFHub(HubOperation):
     def download_model(cls,
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
-                       ignore_file_pattern: Optional[List[str]] = None,
+                       ignore_patterns: Optional[List[str]] = None,
                        **kwargs):
         if revision is None or revision == 'master':
             revision = 'main'
@@ -444,7 +442,7 @@ class HFHub(HubOperation):
             _snapshot_download.HF_HUB_ENABLE_HF_TRANSFER = True
         from huggingface_hub import snapshot_download
         return snapshot_download(
-            model_id_or_path, repo_type='model', revision=revision, ignore_patterns=ignore_file_pattern, **kwargs)
+            model_id_or_path, repo_type='model', revision=revision, ignore_patterns=ignore_patterns, **kwargs)
 
 
 def get_hub(use_hf: Optional[bool] = None):

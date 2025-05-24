@@ -17,6 +17,9 @@ class SwiftPipeline(ABC, ProcessorMixin):
     def __init__(self, args: Union[List[str], args_class, None] = None):
         self.args = self._parse_args(args)
         args = self.args
+        if hasattr(args, 'seed'):
+            seed = args.seed + max(getattr(args, 'rank', -1), 0)
+            seed_everything(seed)
         logger.info(f'args: {args}')
         self._compat_dsw_gradio(args)
 
@@ -34,14 +37,13 @@ class SwiftPipeline(ABC, ProcessorMixin):
 
     @staticmethod
     def _compat_dsw_gradio(args) -> None:
-        from swift.llm import WebUIArguments
-        if (isinstance(args, WebUIArguments) and 'JUPYTER_NAME' in os.environ and 'dsw-' in os.environ['JUPYTER_NAME']
-                and 'GRADIO_ROOT_PATH' not in os.environ):
-            os.environ['GRADIO_ROOT_PATH'] = f"/{os.environ['JUPYTER_NAME']}/proxy/{args.port}"
+        from swift.llm import WebUIArguments, AppArguments
+        if (isinstance(args, (WebUIArguments, AppArguments)) and 'JUPYTER_NAME' in os.environ
+                and 'dsw-' in os.environ['JUPYTER_NAME'] and 'GRADIO_ROOT_PATH' not in os.environ):
+            os.environ['GRADIO_ROOT_PATH'] = f"/{os.environ['JUPYTER_NAME']}/proxy/{args.server_port}"
 
     def main(self):
         logger.info(f'Start time of running main: {dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}')
-        seed_everything(self.args.seed)
         result = self.run()
         logger.info(f'End time of running main: {dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}')
         return result

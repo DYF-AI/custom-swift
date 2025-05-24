@@ -4,22 +4,29 @@ import re
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from ..preprocessor import (AlpacaPreprocessor, ClsPreprocessor, MessagesPreprocessor, ResponsePreprocessor,
-                            RowPreprocessor, TextGenerationPreprocessor)
+import json
+import numpy as np
+
+from ...template import split_str_parts_by
+from ..preprocessor import (AlpacaPreprocessor, ClsGenerationPreprocessor, ClsPreprocessor, MessagesPreprocessor,
+                            ResponsePreprocessor, RowPreprocessor, TextGenerationPreprocessor)
 from ..register import DatasetMeta, SubsetDataset, register_dataset
 
 
-def _concat_inst_inp_alpaca_zh(inst: str, inp: str) -> str:
-    if inp.startswith('输入：'):
-        inp = inp[3:]
-    return f'{inst}\n{inp}'
+class AlpacaZhPreprocessor(AlpacaPreprocessor):
+
+    @classmethod
+    def concat_inst_input(cls, instruction, input_):
+        if input_ and input_.startswith('输入：'):
+            input_ = input_[3:]
+        return super().concat_inst_input(instruction, input_)
 
 
 register_dataset(
     DatasetMeta(
         ms_dataset_id='AI-ModelScope/alpaca-gpt4-data-zh',
         hf_dataset_id='llm-wizard/alpaca-gpt4-data-zh',
-        preprocess_func=AlpacaPreprocessor(concat_inst_input=_concat_inst_inp_alpaca_zh),
+        preprocess_func=AlpacaZhPreprocessor(),
         tags=['chat', 'general', '🔥'],
     ))
 
@@ -68,6 +75,22 @@ register_dataset(
         tags=['pretrain', '🔥']))
 
 
+class MathTrnPreprocessor(ResponsePreprocessor):
+
+    def preprocess(self, row):
+        query = row['query']
+        output = row['response']
+        row = {
+            'query': query,
+            'response': output,
+        }
+        return super().preprocess(row)
+
+
+register_dataset(
+    DatasetMeta(ms_dataset_id='AI-ModelScope/math-trn-format', preprocess_func=MathTrnPreprocessor(), tags=['math']))
+
+
 def _repair_ms_bench(messages: str) -> Optional[List[Dict[str, str]]]:
     if isinstance(messages, str):
         messages = ast.literal_eval(messages)
@@ -113,6 +136,7 @@ register_dataset(
                 preprocess_func=MessagesPreprocessor(repair_messages=partial(_repair_agent_messages, use_mini=True)),
                 is_weak_subset=True)
         ],
+        split=['train', 'validation'],
         tags=['chat', 'agent', 'multi-round']))
 
 advertise_gen_prompt = """Task: Generating advertisements based on keywords.
@@ -124,16 +148,16 @@ register_dataset(
         ms_dataset_id='lvjianjin/AdvertiseGen',
         hf_dataset_id='shibing624/AdvertiseGen',
         preprocess_func=TextGenerationPreprocessor(
-            prompt=advertise_gen_prompt, columns_mapping={
+            prompt=advertise_gen_prompt, columns={
                 'content': 'query',
                 'summary': 'response'
             }),
         tags=['text-generation', '🔥'],
+        split=['train', 'validation'],
     ))
 
 
 class FireflyPreprocessor(ResponsePreprocessor):
-
     _firefly_kind_list = {
         'ProseGeneration', 'MRC', 'JinYongGeneration', 'TextCorrection', 'ClassicalChinese', 'BELLE', 'StoryGeneration',
         'Couplet', 'Cot', 'Dictionary', 'Translation', 'Program', 'SentimentAnalyze', 'OpenQA', 'AncientPoem',
@@ -160,17 +184,32 @@ register_dataset(
         ms_dataset_id='modelscope/clue',
         hf_dataset_id='clue',
         subsets=['cmnli'],
-        preprocess_func=ClsPreprocessor(['neutral', 'entailment', 'contradiction'],
-                                        task='Natural Language Inference',
-                                        is_pair_seq=True),
+        preprocess_func=ClsGenerationPreprocessor(['neutral', 'entailment', 'contradiction'],
+                                                  task='Natural Language Inference',
+                                                  is_pair_seq=True),
         tags=['text-generation', 'classification'],
+        split=['train', 'validation'],
     ))
 
 register_dataset(
     DatasetMeta(
         ms_dataset_id='DAMO_NLP/jd',
-        preprocess_func=ClsPreprocessor(['negative', 'positive'], task='Sentiment Classification', is_pair_seq=False),
-        tags=['text-generation', 'classification', '🔥']))
+        subsets=[
+            SubsetDataset(
+                'default',
+                'default',
+                preprocess_func=ClsGenerationPreprocessor(['negative', 'positive'],
+                                                          task='Sentiment Classification',
+                                                          is_pair_seq=False)),
+            SubsetDataset(
+                'cls',
+                'default',
+                preprocess_func=ClsPreprocessor(columns={'sentence': 'query'}),
+            ),
+        ],
+        tags=['text-generation', 'classification', '🔥'],
+        split=['train', 'validation'],
+    ))
 
 
 class SyntheticText2SqlPreprocessor(ResponsePreprocessor):
@@ -227,7 +266,7 @@ register_dataset(
     DatasetMeta(
         ms_dataset_id='AI-ModelScope/sql-create-context',
         hf_dataset_id='b-mc2/sql-create-context',
-        preprocess_func=AlpacaPreprocessor(columns_mapping={
+        preprocess_func=AlpacaPreprocessor(columns={
             'question': 'instruction',
             'context': 'input',
             'answer': 'output'
@@ -260,7 +299,7 @@ register_dataset(
 register_dataset(
     DatasetMeta(
         ms_dataset_id='codefuse-ai/CodeExercise-Python-27k',
-        preprocess_func=MessagesPreprocessor(columns_mapping={'chat_rounds': 'messages'}),
+        preprocess_func=MessagesPreprocessor(columns={'chat_rounds': 'messages'}),
         tags=['chat', 'coding', '🔥']))
 
 
@@ -284,6 +323,53 @@ register_dataset(
         tags=['chat', 'coding', '🔥']))
 
 
+class StsbPreprocessor(ResponsePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row = {
+            'query': row['sentence1'],
+            'response': row['sentence2'],
+            'label': row['score'],
+        }
+        return super().preprocess(row)
+
+
+class StsbGeneratePreprocessor(ResponsePreprocessor):
+    prompt = """Task: Based on the given two sentences, provide a similarity score between 0.0 and 1.0.
+Sentence 1: {text1}
+Sentence 2: {text2}
+Similarity score: """
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return super().preprocess({
+            'query': self.prompt.format(text1=row['sentence1'], text2=row['sentence2']),
+            'response': f"{row['score']:.1f}"
+        })
+
+
+class StsbRegressionPreprocessor(StsbGeneratePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return super(StsbGeneratePreprocessor, self).preprocess({
+            'query':
+            self.prompt.format(text1=row['sentence1'], text2=row['sentence2']),
+            'label':
+            row['score']
+        })
+
+
+register_dataset(
+    DatasetMeta(
+        ms_dataset_id='sentence-transformers/stsb',
+        hf_dataset_id='sentence-transformers/stsb',
+        subsets=[
+            SubsetDataset('default', preprocess_func=StsbPreprocessor()),  # embedding
+            SubsetDataset('generate', preprocess_func=StsbGeneratePreprocessor()),
+            SubsetDataset('reg', preprocess_func=StsbRegressionPreprocessor()),
+        ],
+        tags=['similarity', '🔥']))
+
+
 def _repair_conversations_agent_instruct(s: str) -> List[Dict[str, Any]]:
     s = s.replace('}\n {', '},\n {')
     if isinstance(s, str):
@@ -303,8 +389,7 @@ class MultiRoleAgentPreprocessor(RowPreprocessor):
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         conv = row['conversations']
-        res_prompt = """\n\n【注意事项】\n1. 这是聊天室，不要发送私信给任何人\n2. 仅代表你个人说话,不要扮演其他人，
-        只根据对话历史进行回复\n3. 长话短说，不要说太多话，不要超过50字 """
+        res_prompt = '\n\n【注意事项】\n1. 这是聊天室，不要发送私信给任何人\n2. 仅代表你个人说话,不要扮演其他人，只根据对话历史进行回复\n3. 长话短说，不要说太多话，不要超过50字 '
         history_prompt = '\n\n【chat history】'
         conv_prompt = '\n {name}:{content}'
         query, response = '', conv[-1]['value']
@@ -342,6 +427,47 @@ register_dataset(
 
 register_dataset(DatasetMeta(ms_dataset_id='swift/ToolBench', tags=['chat', 'agent', 'multi-round']))
 
+register_dataset(
+    DatasetMeta(
+        ms_dataset_id='tastelikefeet/competition_math',
+        subsets=[
+            SubsetDataset(
+                name='default',
+                subset='default',
+                split=['train', 'test'],
+            ),
+        ],
+        tags=['qa', 'math']))
+
+register_dataset(DatasetMeta(ms_dataset_id='modelscope/gsm8k', subsets=['main'], split=['train'], tags=['qa', 'math']))
+
+register_dataset(
+    DatasetMeta(ms_dataset_id='modelscope/MathR', subsets=['default', 'clean'], split=['train'], tags=['qa', 'math']))
+
+register_dataset(
+    DatasetMeta(ms_dataset_id='modelscope/MathR-32B-Distill', subsets=['data'], split=['train'], tags=['qa', 'math']))
+
+
+class CoundownTaskPreprocessor(ResponsePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        numbers = row['nums']
+        target = row.pop('response', None)
+        query = (f'Using the numbers {numbers}, create an equation that equals {target}.\n'
+                 'You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.\n'
+                 'Show your work in <think> </think> tags. And return the final equation and answer '
+                 'in <answer> </answer> tags, for example <answer> (1 + 2) / 3 * 4 = 4 </answer>.')
+        row.update({'target': target, 'query': query})
+        return super().preprocess(row)
+
+
+register_dataset(
+    DatasetMeta(
+        ms_dataset_id='zouxuhong/Countdown-Tasks-3to4',
+        subsets=['default'],
+        preprocess_func=CoundownTaskPreprocessor(),
+        tags=['math']))
+
 
 class HC3Preprocessor(ResponsePreprocessor):
     prompt = """Classification Task: Are the following responses from a human or from ChatGPT?
@@ -353,7 +479,8 @@ Output:"""
     def preprocess(self, row):
         rows = []
         for response in ['Human', 'ChatGPT']:
-            query = self.prompt.format(question=row['query'], answer=row[f'{response.lower()}_answers'])
+            query = self.prompt.format(
+                question=row['query'], answer=self.random_state.choice(row[f'{response.lower()}_answers']))
             rows.append(super().preprocess({'query': query, 'response': response}))
         return rows
 
@@ -363,7 +490,8 @@ class HC3ClsPreprocessor(HC3Preprocessor):
     def preprocess(self, row):
         rows = []
         for i, response in enumerate(['Human', 'ChatGPT']):
-            query = self.prompt.format(question=row['query'], answer=row[f'{response.lower()}_answers'])
+            query = self.prompt.format(
+                question=row['query'], answer=self.random_state.choice(row[f'{response.lower()}_answers']))
             rows.append(ResponsePreprocessor.preprocess(self, {'query': query, 'label': i}))
         return rows
 
@@ -391,11 +519,27 @@ register_dataset(
         subsets=hc3_subsets,
         tags=['text-generation', 'classification', '🔥']))
 
+hc3_subset_names = ['finance', 'medicine']
+hc3_subsets: List[SubsetDataset] = []
+for hc3_subset_name in hc3_subset_names:
+    hc3_subsets.append(
+        SubsetDataset(
+            name=hc3_subset_name,
+            subset=hc3_subset_name,
+            preprocess_func=HC3Preprocessor(),
+        ))
+    hc3_subsets.append(
+        SubsetDataset(
+            name=f'{hc3_subset_name}_cls',
+            subset=hc3_subset_name,
+            preprocess_func=HC3ClsPreprocessor(),
+        ))
+
 register_dataset(
     DatasetMeta(
         ms_dataset_id='simpleai/HC3',
         hf_dataset_id='Hello-SimpleAI/HC3',
-        subsets=['finance', 'medicine'],
+        subsets=hc3_subsets,
         preprocess_func=HC3Preprocessor(),
         tags=['text-generation', 'classification', '🔥']))
 
@@ -457,9 +601,45 @@ register_dataset(
         ms_dataset_id='AI-ModelScope/hh-rlhf',
         subsets=['helpful-base', 'helpful-online', 'helpful-rejection-sampled'],
         preprocess_func=HHRLHFPreprocessor(),
-        split=['train'],
+        split=['train', 'test'],
         tags=['rlhf', 'dpo'],
         huge_dataset=True))
+
+
+class XlamFunctionCallingPreprocessor(RowPreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        messages = [{'role': 'user', 'content': row['query']}]
+        response = row['answers']
+        response = json.loads(response)
+        messages += [{'role': 'tool_call', 'content': json.dumps(content)} for content in response]
+        return {'messages': messages, 'tools': row['tools']}
+
+
+class XlamFunctionCallingGRPOPreprocessor(ResponsePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        query = row['query']
+        answers = row['response']
+        if isinstance(answers, str):
+            answers = json.loads(answers)
+        answer = np.random.choice(answers)
+        name = answer['name']
+        args = json.dumps(answer['arguments'])
+        response = f'Action: {name}\nAction Input: {args}'
+        row = {'query': query, 'response': response, 'solution': response, 'tools': row['tools']}
+        return super().preprocess(row)
+
+
+register_dataset(
+    DatasetMeta(
+        ms_dataset_id='LLM-Research/xlam-function-calling-60k',
+        hf_dataset_id='Salesforce/xlam-function-calling-60k',
+        subsets=[
+            SubsetDataset('default', 'dataset', preprocess_func=XlamFunctionCallingPreprocessor()),
+            SubsetDataset('grpo', 'dataset', preprocess_func=XlamFunctionCallingGRPOPreprocessor())
+        ],
+        tags=['agent', 'grpo', '🔥']))
 
 
 class HHRLHFCNPreprocessor(MessagesPreprocessor):
@@ -474,7 +654,7 @@ register_dataset(
     DatasetMeta(
         ms_dataset_id='AI-ModelScope/hh_rlhf_cn',
         subsets=['hh_rlhf', 'harmless_base_cn', 'harmless_base_en', 'helpful_base_cn', 'helpful_base_en'],
-        preprocess_func=HHRLHFCNPreprocessor(columns_mapping={'context': 'messages'}, content_key='text'),
+        preprocess_func=HHRLHFCNPreprocessor(columns={'context': 'messages'}, content_key='text'),
         split=['train', 'test'],
         tags=['rlhf', 'dpo', '🔥']))
 
@@ -499,20 +679,11 @@ register_dataset(
 register_dataset(
     DatasetMeta(
         ms_dataset_id='hjh0119/shareAI-Llama3-DPO-zh-en-emoji',
-        subsets=[
-            SubsetDataset(
-                'zh',
-                preprocess_func=ResponsePreprocessor(columns_mapping={
-                    'answer_zh': 'response',
-                    'answer_en': 'rejected_response'
-                })),
-            SubsetDataset(
-                'en',
-                preprocess_func=ResponsePreprocessor(columns_mapping={
-                    'answer_en': 'response',
-                    'answer_zh': 'rejected_response'
-                }))
-        ],
+        hf_dataset_id='shareAI/DPO-zh-en-emoji',
+        preprocess_func=ResponsePreprocessor(columns={
+            'answer_zh': 'response',
+            'answer_en': 'rejected_response'
+        }),
         tags=['rlhf', 'dpo']))
 
 register_dataset(
@@ -541,7 +712,6 @@ class GuanacoPreprocessor(RowPreprocessor):
         output = row['output']
         history = []
         if instruction:
-            from swift.llm.template import split_str_parts_by
             parts = split_str_parts_by(
                 instruction, ['User:', 'User：', 'Assistant：', 'Assistant:', 'Asssistent:', 'Assistent:', 'Assistenz:'])
             for idx, part in enumerate(parts):
@@ -575,6 +745,27 @@ register_dataset(
         hf_dataset_id='JosephusCheung/GuanacoDataset',
         preprocess_func=GuanacoPreprocessor(),
         tags=['chat', 'zh']))
+
+
+class FunctionCallChatmlPreprocessor(MessagesPreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        res = super().preprocess(row)
+
+        if res['function_description']:
+            res['tools'] = res['function_description'].split('\n\n')
+        messages = res['messages']
+        if messages[0]['role'] == 'system':
+            messages.pop(0)
+        return res
+
+
+register_dataset(
+    DatasetMeta(
+        ms_dataset_id='AI-ModelScope/function-calling-chatml',
+        hf_dataset_id='Locutusque/function-calling-chatml',
+        preprocess_func=FunctionCallChatmlPreprocessor(),
+        tags=['agent', 'en', 'sft', '🔥']))
 
 
 class Dolly15kPreprocessor(RowPreprocessor):
@@ -620,7 +811,7 @@ register_dataset(
     DatasetMeta(
         ms_dataset_id='AI-ModelScope/orpo-dpo-mix-40k',
         hf_dataset_id='mlabonne/orpo-dpo-mix-40k',
-        preprocess_func=OrpoDPOMix40kPreprocessor(columns_mapping={
+        preprocess_func=OrpoDPOMix40kPreprocessor(columns={
             'chosen': 'messages',
             'rejected': 'rejected_messages'
         }),
@@ -651,9 +842,28 @@ class SelfCognitionPreprocessor(ResponsePreprocessor):
         return super().preprocess(row)
 
 
+class Qwen3SelfCognitionPreprocessor(SelfCognitionPreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row['query'] = row['query'] + ' /no_think'
+        row['response'] = '<think>\n\n</think>\n\n' + row['response']
+        return super().preprocess(row)
+
+
+class EmptyThinkSelfCognitionPreprocessor(SelfCognitionPreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row['response'] = '<think>\n\n</think>\n\n' + row['response']
+        return super().preprocess(row)
+
+
 register_dataset(
     DatasetMeta(
         ms_dataset_id='swift/self-cognition',
         hf_dataset_id='modelscope/self-cognition',
-        preprocess_func=SelfCognitionPreprocessor(),
+        subsets=[
+            SubsetDataset(preprocess_func=SelfCognitionPreprocessor()),
+            SubsetDataset('qwen3', preprocess_func=Qwen3SelfCognitionPreprocessor()),
+            SubsetDataset('empty_think', preprocess_func=EmptyThinkSelfCognitionPreprocessor()),
+        ],
         tags=['chat', 'self-cognition', '🔥']))

@@ -119,18 +119,17 @@ if __name__ == '__main__':
     install_requires, deps_link = parse_requirements('requirements.txt')
     extra_requires = {}
     all_requires = []
-    extra_requires['llm'], _ = parse_requirements('requirements/llm.txt')
     extra_requires['eval'], _ = parse_requirements('requirements/eval.txt')
+    extra_requires['swanlab'], _ = parse_requirements('requirements/swanlab.txt')
     extra_requires['seq_parallel'], _ = parse_requirements('requirements/seq_parallel.txt')
     all_requires.extend(install_requires)
-    all_requires.extend(extra_requires['llm'])
     all_requires.extend(extra_requires['eval'])
     all_requires.extend(extra_requires['seq_parallel'])
-    extra_requires['seq_parallel'].extend(extra_requires['llm'])
+    all_requires.extend(extra_requires['swanlab'])
     extra_requires['all'] = all_requires
 
     setup(
-        name='ms-swift',
+        name='ms_swift',
         version=get_version(),
         description='Swift: Scalable lightWeight Infrastructure for Fine-Tuning',
         long_description=readme(),
@@ -159,6 +158,8 @@ if __name__ == '__main__':
         tests_require=parse_requirements('requirements/tests.txt'),
         install_requires=install_requires,
         extras_require=extra_requires,
-        entry_points={'console_scripts': ['swift=swift.cli.main:cli_main']},
+        entry_points={
+            'console_scripts': ['swift=swift.cli.main:cli_main', 'megatron=swift.cli._megatron.main:cli_main']
+        },
         dependency_links=deps_link,
         zip_safe=False)

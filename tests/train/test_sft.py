@@ -1,8 +1,6 @@
 import os
 
-import torch
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 kwargs = {
     'per_device_train_batch_size': 2,
@@ -16,50 +14,71 @@ kwargs = {
 def test_llm_ddp():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
-    sft_main(
+    result = sft_main(
         TrainArguments(
-            model='qwen/Qwen2-7B-Instruct',
+            model='Qwen/Qwen2-7B-Instruct',
             dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
             # ddp_find_unused_parameters=False,
             gradient_checkpointing_kwargs={'use_reentrant': False},
+            target_modules=['all-linear', 'all-embedding'],
+            modules_to_save=['all-embedding', 'all-norm'],
             **kwargs))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
+
+
+def test_unsloth():
+    from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
+    result = sft_main(
+        TrainArguments(
+            model='Qwen/Qwen2-0.5B',
+            dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
+            max_steps=5,
+            tuner_backend='unsloth',
+            **kwargs))
+    last_model_checkpoint = result['last_model_checkpoint']
+    result = sft_main(TrainArguments(resume_from_checkpoint=last_model_checkpoint, load_data_args=True, max_steps=10))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
 
 
 def test_mllm_mp():
     os.environ['MAX_PIXELS'] = '100352'
-    os.environ['SIZE_FACTOR'] = '12'
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     result = sft_main(
         TrainArguments(
-            model='qwen/Qwen2-VL-7B-Instruct',
-            dataset=['modelscope/coco_2014_caption:validation#20', 'AI-ModelScope/alpaca-gpt4-data-en#20'],
+            model='bytedance-research/Valley-Eagle-7B',
+            dataset=['modelscope/coco_2014_caption:validation#20'],
+            # dataset=['modelscope/coco_2014_caption:validation#20', 'AI-ModelScope/alpaca-gpt4-data-en#20'],
             train_type='lora',
+            target_modules=['all-linear'],
+            freeze_aligner=False,
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True, merge_lora=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True, merge_lora=True))
 
 
 def test_llm_streaming():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     result = sft_main(
         TrainArguments(
-            model='qwen/Qwen2-7B-Instruct', dataset=['swift/chinese-c4'], streaming=True, max_steps=16, **kwargs))
+            model='Qwen/Qwen2-7B-Instruct', dataset=['swift/chinese-c4'], streaming=True, max_steps=16, **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True, merge_lora=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True, merge_lora=True))
 
 
 def test_mllm_streaming():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     result = sft_main(
         TrainArguments(
-            model='qwen/Qwen2-VL-7B-Instruct',
+            model='Qwen/Qwen2-VL-7B-Instruct',
             dataset=['modelscope/coco_2014_caption:validation', 'AI-ModelScope/alpaca-gpt4-data-en'],
             streaming=True,
             max_steps=16,
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True, merge_lora=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True, merge_lora=True))
 
 
 def test_mllm_zero3():
@@ -67,7 +86,7 @@ def test_mllm_zero3():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     sft_main(
         TrainArguments(
-            model='qwen/Qwen2-VL-7B-Instruct',
+            model='Qwen/Qwen2-VL-7B-Instruct',
             dataset=['modelscope/coco_2014_caption:validation#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],  #
             deepspeed='zero3',
             **kwargs))
@@ -78,7 +97,7 @@ def test_qwen_vl():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     sft_main(
         TrainArguments(
-            model='qwen/Qwen-VL-Chat',
+            model='Qwen/Qwen-VL-Chat',
             dataset=['AI-ModelScope/LaTeX_OCR#40', 'modelscope/coco_2014_caption:validation#40'],
             **kwargs))
 
@@ -91,7 +110,7 @@ def test_qwen2_audio():
             model='Qwen/Qwen2-Audio-7B-Instruct',
             dataset=['speech_asr/speech_asr_aishell1_trainsets:validation#200'],
             freeze_parameters_ratio=1,
-            trainable_parameters='audio_tower',
+            trainable_parameters=['audio_tower'],
             train_type='full',
             **kwargs))
 
@@ -104,7 +123,7 @@ def test_llm_gptq():
             dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True))
 
 
 def test_llm_awq():
@@ -115,7 +134,7 @@ def test_llm_awq():
             dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True))
 
 
 def test_mllm_streaming_zero3():
@@ -123,7 +142,7 @@ def test_mllm_streaming_zero3():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     sft_main(
         TrainArguments(
-            model='qwen/Qwen2-VL-7B-Instruct',
+            model='Qwen/Qwen2-VL-7B-Instruct',
             dataset=['modelscope/coco_2014_caption:validation', 'AI-ModelScope/alpaca-gpt4-data-en'],
             streaming=True,
             max_steps=16,
@@ -136,7 +155,7 @@ def test_mllm_streaming_mp_ddp():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     sft_main(
         TrainArguments(
-            model='qwen/Qwen2-VL-7B-Instruct',
+            model='Qwen/Qwen2-VL-7B-Instruct',
             dataset=['modelscope/coco_2014_caption:validation', 'AI-ModelScope/alpaca-gpt4-data-en'],
             streaming=True,
             max_steps=16,
@@ -154,7 +173,7 @@ def test_llm_hqq():
             quant_bits=4,
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True))
 
 
 def test_llm_bnb():
@@ -167,18 +186,18 @@ def test_llm_bnb():
             quant_bits=4,
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True))
 
 
 def test_moe():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     result = sft_main(
         TrainArguments(
-            model='qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4',
+            model='Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4',
             dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True))
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
 
 
 def test_resume_from_checkpoint():
@@ -188,10 +207,18 @@ def test_resume_from_checkpoint():
             model='Qwen/Qwen2-0.5B',
             dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
             max_steps=5,
+            streaming=True,
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
     result = sft_main(
-        TrainArguments(resume_from_checkpoint=last_model_checkpoint, load_dataset_config=True, max_steps=10))
+        TrainArguments(
+            resume_from_checkpoint=last_model_checkpoint,
+            streaming=True,
+            load_data_args=True,
+            max_steps=10,
+        ))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
 
 
 def test_resume_only_model():
@@ -209,10 +236,7 @@ def test_resume_only_model():
     last_model_checkpoint = result['last_model_checkpoint']
     result = sft_main(
         TrainArguments(
-            resume_from_checkpoint=last_model_checkpoint,
-            load_dataset_config=True,
-            max_steps=20,
-            resume_only_model=True))
+            resume_from_checkpoint=last_model_checkpoint, load_data_args=True, max_steps=20, resume_only_model=True))
 
 
 def test_llm_transformers_4_33():
@@ -220,7 +244,7 @@ def test_llm_transformers_4_33():
     from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
     sft_main(
         TrainArguments(
-            model='qwen/Qwen-7B-Chat',
+            model='Qwen/Qwen-7B-Chat',
             dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
             **kwargs))
 
@@ -232,7 +256,7 @@ def test_predict_with_generate():
     # 'modelscope/coco_2014_caption:validation#100',
     sft_main(
         TrainArguments(
-            model='qwen/Qwen2-7B-Instruct',
+            model='Qwen/Qwen2-7B-Instruct',
             dataset=['AI-ModelScope/alpaca-gpt4-data-en#40'],
             predict_with_generate=True,
             split_dataset_ratio=0.5,
@@ -246,7 +270,7 @@ def test_predict_with_generate_zero3():
     # 'modelscope/coco_2014_caption:validation#100',
     sft_main(
         TrainArguments(
-            model='qwen/Qwen2-VL-7B-Instruct',
+            model='Qwen/Qwen2-VL-7B-Instruct',
             dataset=['AI-ModelScope/LaTeX_OCR#40'],
             predict_with_generate=True,
             freeze_vit=False,
@@ -268,7 +292,81 @@ def test_template():
             model_author=['swift'],
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
-    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_dataset_config=True, merge_lora=True))
+    infer_main(InferArguments(ckpt_dir=last_model_checkpoint, load_data_args=True, merge_lora=True))
+
+
+def test_emu3_gen():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    os.environ['max_position_embeddings'] = '10240'
+    os.environ['image_area'] = '518400'
+    from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
+    kwargs['num_train_epochs'] = 100
+    result = sft_main(TrainArguments(model='BAAI/Emu3-Gen', dataset=['swift/TextCaps#2'], **kwargs))
+    last_model_checkpoint = result['last_model_checkpoint']
+    args = InferArguments(
+        ckpt_dir=last_model_checkpoint,
+        infer_backend='pt',
+        stream=False,
+        use_chat_template=False,
+        top_k=2048,
+        max_new_tokens=40960)
+    infer_main(args)
+
+
+def test_eval_strategy():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
+    result = sft_main(
+        TrainArguments(
+            model='Qwen/Qwen2-7B-Instruct',
+            eval_strategy='no',
+            dataset=['AI-ModelScope/alpaca-gpt4-data-zh#100', 'AI-ModelScope/alpaca-gpt4-data-en#100'],
+            **kwargs))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
+
+
+def test_epoch():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
+
+    train_kwargs = kwargs.copy()
+    train_kwargs['num_train_epochs'] = 3
+    # train_kwargs['save_steps'] = 2  # not use
+    result = sft_main(
+        TrainArguments(
+            model='Qwen/Qwen2-7B-Instruct',
+            dataset=['AI-ModelScope/alpaca-gpt4-data-zh#50', 'AI-ModelScope/alpaca-gpt4-data-en#50'],
+            save_strategy='epoch',
+            **train_kwargs))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
+
+
+def test_agent():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
+
+    result = sft_main(
+        TrainArguments(
+            model='Qwen/Qwen2-7B-Instruct',
+            dataset=['swift/ToolBench#500'],
+            loss_scale='react',
+            agent_template='toolbench',
+            **kwargs))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
+
+
+def test_grounding():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    from swift.llm import sft_main, TrainArguments, infer_main, InferArguments
+
+    result = sft_main(
+        TrainArguments(
+            model='Qwen/Qwen2.5-VL-7B-Instruct', dataset=['AI-ModelScope/coco#200'], dataset_num_proc=4, **kwargs))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True, stream=True, max_new_tokens=2048))
 
 
 if __name__ == '__main__':
@@ -287,8 +385,14 @@ if __name__ == '__main__':
     # test_resume_from_checkpoint()
     # test_resume_only_model()
     # test_llm_transformers_4_33()
-    test_predict_with_generate()
+    # test_predict_with_generate()
     # test_predict_with_generate_zero3()
     # test_template()
     # test_qwen_vl()
     # test_qwen2_audio()
+    # test_emu3_gen()
+    # test_unsloth()
+    # test_eval_strategy()
+    # test_epoch()
+    # test_agent()
+    test_grounding()

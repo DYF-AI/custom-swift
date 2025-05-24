@@ -9,7 +9,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
 from swift.llm import TemplateType
-from swift.utils import get_dist_setting, get_logger
+from swift.utils import get_device_count, get_dist_setting, get_logger
 from ..constant import LLMModelType, MLLMModelType
 from ..model_arch import ModelArch
 from ..patcher import patch_output_to_input_device
@@ -127,6 +127,38 @@ register_model(
 
 register_model(
     ModelMeta(
+        LLMModelType.glm4_0414,
+        [
+            ModelGroup([
+                Model('ZhipuAI/GLM-4-9B-0414', 'THUDM/GLM-4-9B-0414'),
+                Model('ZhipuAI/GLM-4-32B-0414', 'THUDM/GLM-4-32B-0414'),
+                Model('ZhipuAI/GLM-4-32B-Base-0414', 'THUDM/GLM-4-32B-Base-0414'),
+                Model('ZhipuAI/GLM-Z1-9B-0414', 'THUDM/GLM-Z1-9B-0414'),
+                Model('ZhipuAI/GLM-Z1-32B-0414', 'THUDM/GLM-Z1-32B-0414'),
+            ])
+        ],
+        TemplateType.glm4_0414,
+        get_model_tokenizer_with_flash_attn,
+        architectures=['Glm4ForCausalLM'],
+        model_arch=ModelArch.chatglm,
+        requires=['transformers>=4.51'],
+    ))
+
+register_model(
+    ModelMeta(
+        LLMModelType.glm4_z1_rumination,
+        [ModelGroup([
+            Model('ZhipuAI/GLM-Z1-Rumination-32B-0414', 'THUDM/GLM-Z1-Rumination-32B-0414'),
+        ])],
+        TemplateType.glm4_z1_rumination,
+        get_model_tokenizer_with_flash_attn,
+        architectures=['Glm4ForCausalLM'],
+        model_arch=ModelArch.chatglm,
+        requires=['transformers>4.51'],
+    ))
+
+register_model(
+    ModelMeta(
         LLMModelType.longwriter_llama3_1,
         [ModelGroup([
             Model('ZhipuAI/LongWriter-llama3.1-8b', 'THUDM/LongWriter-llama3.1-8b'),
@@ -163,7 +195,7 @@ def get_model_tokenizer_glm4v(model_dir: str,
     tokenizer.init_kwargs['image_size'] = 1120
     if load_model:
         # fix device_map 4
-        n_gpu = torch.cuda.device_count()
+        n_gpu = get_device_count()
         local_world_size = get_dist_setting()[3]
         if n_gpu // local_world_size >= 4:
             for layer in model.transformer.vision.transformer.layers:
@@ -178,14 +210,24 @@ def get_model_tokenizer_glm4v(model_dir: str,
 register_model(
     ModelMeta(
         MLLMModelType.glm4v,
-        [ModelGroup([
-            Model('ZhipuAI/glm-4v-9b', 'THUDM/glm-4v-9b'),
-        ])],
+        [
+            ModelGroup(
+                [
+                    Model('ZhipuAI/glm-4v-9b', 'THUDM/glm-4v-9b'),
+                ],
+                requires=['transformers>=4.42,<4.45'],
+            ),
+            ModelGroup(
+                [
+                    Model('ZhipuAI/cogagent-9b-20241220', 'THUDM/cogagent-9b-20241220'),
+                ],
+                requires=['transformers>=4.42'],
+            )
+        ],
         TemplateType.glm4v,
         get_model_tokenizer_glm4v,
         architectures=['ChatGLMModel', 'ChatGLMForConditionalGeneration'],
         model_arch=ModelArch.glm4v,
-        requires=['transformers>=4.42'],
     ))
 
 
@@ -194,7 +236,7 @@ def get_model_tokenizer_cogvlm(model_dir: str,
                                model_kwargs: Dict[str, Any],
                                load_model: bool = True,
                                **kwargs):
-    tokenizer_dir = safe_snapshot_download('AI-ModelScope/vicuna-7b-v1.5', download_model=False)
+    tokenizer_dir = safe_snapshot_download('AI-ModelScope/vicuna-7b-v1.5', download_model=False, check_local=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
     if load_model:
         logger.warning('CogAgent with FusedLayerNorm will cause an training loss of NAN, '

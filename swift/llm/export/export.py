@@ -18,19 +18,29 @@ class SwiftExport(SwiftPipeline):
     def run(self):
         args = self.args
         if args.to_peft_format:
-            args.ckpt_dir = swift_to_peft_format(args.ckpt_dir, args.output_dir)
-        elif args.merge_lora:
+            args.adapters[0] = swift_to_peft_format(args.adapters[0], args.output_dir)
+        if args.merge_lora:
+            output_dir = args.output_dir
+            if args.to_peft_format or args.quant_method or args.to_ollama or args.push_to_hub:
+                args.output_dir = None
             merge_lora(args)
-        elif args.quant_method is not None:
+            args.output_dir = output_dir  # recover
+        if args.quant_method:
             quantize_model(args)
         elif args.to_ollama:
             export_to_ollama(args)
+        elif args.to_mcore:
+            from swift.megatron import convert_hf2mcore
+            convert_hf2mcore(args)
+        elif args.to_hf:
+            from swift.megatron import convert_mcore2hf
+            convert_mcore2hf(args)
         elif args.push_to_hub:
-            ckpt_dir = args.ckpt_dir or args.model
-            assert ckpt_dir is not None, 'You need to specify `ckpt_dir`.'
+            model_dir = args.adapters and args.adapters[0] or args.model_dir
+            assert model_dir, f'model_dir: {model_dir}'
             args.hub.push_to_hub(
                 args.hub_model_id,
-                ckpt_dir,
+                model_dir,
                 token=args.hub_token,
                 private=args.hub_private_repo,
                 commit_message=args.commit_message)

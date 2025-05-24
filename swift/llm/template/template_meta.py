@@ -38,16 +38,13 @@ class TemplateMeta:
     chat_sep: Optional[Prompt]
     suffix: Prompt = field(default_factory=lambda: [['eos_token_id']])
     template_cls: Type[Template] = Template
-    tool_prompt: Optional[Prompt] = None
     system_prefix: Optional[Prompt] = None
+    default_system: Optional[str] = None
+    response_prefix: str = ''
 
     auto_add_bos: bool = False
-    default_system: Optional[str] = None
     stop_words: List[Word] = field(default_factory=list)
-    placeholder_tokens: List[Union[int, str]] = field(default_factory=list)
-
-    default_tools_prompt: str = 'react_en'
-    support_stream: bool = True
+    agent_template: str = 'react_en'
 
     def to_generate_template_meta(self) -> 'TemplateMeta':
         self = deepcopy(self)
@@ -59,8 +56,6 @@ class TemplateMeta:
             template_cls=self.template_cls,
             auto_add_bos=True,
             stop_words=self.stop_words,
-            placeholder_tokens=self.placeholder_tokens,
-            support_stream=self.support_stream,
         )
 
     @staticmethod
@@ -75,7 +70,7 @@ class TemplateMeta:
         # check
         for x in [self.prefix, self.prompt, self.suffix]:
             assert isinstance(x, list)
-        for x in [self.chat_sep, self.system_prefix, self.tool_prompt]:
+        for x in [self.chat_sep, self.system_prefix]:
             assert x is None or isinstance(x, list)
 
     def __post_init__(self):
@@ -97,8 +92,6 @@ class TemplateMeta:
         self.check_system(self.default_system)
 
         self.support_multi_round = self.chat_sep is not None
-        if self.tool_prompt is None:
-            self.tool_prompt = self.prompt  # default as user
 
     @staticmethod
     def _token_attr_to_id(tokenizer: PreTrainedTokenizerBase, value: Optional[Prompt]) -> Optional[Prompt]:
@@ -121,14 +114,22 @@ class TemplateMeta:
             value = self._token_attr_to_id(tokenizer, value)
             setattr(self, key, value)
 
-        for i, token in enumerate(self.placeholder_tokens):
-            if isinstance(token, str):
-                self.placeholder_tokens[i] = tokenizer.convert_tokens_to_ids(token)
-
         if self.suffix and self.suffix[-1] not in self.stop_words:
             self.stop_words.append(self.suffix[-1])
         if tokenizer.eos_token not in self.stop_words:
             self.stop_words.append(tokenizer.eos_token)
+
+        self.stop_token_id = tokenizer.eos_token_id
+        if self.suffix:
+            suffix_tokens = self.suffix[-1]
+            if isinstance(suffix_tokens, str):
+                stop_token_id = tokenizer.convert_tokens_to_ids(suffix_tokens)
+            elif isinstance(suffix_tokens, list) and len(suffix_tokens) == 1:
+                stop_token_id = suffix_tokens[0]
+            else:
+                stop_token_id = None
+            if stop_token_id is not None:
+                self.stop_token_id = stop_token_id
 
     def check_system(self, system: Optional[str]) -> None:
         if system is not None:

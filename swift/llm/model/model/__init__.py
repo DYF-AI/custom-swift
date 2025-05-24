@@ -1,2 +1,3 @@
-from . import (baai, baichuan, codefuse, deepseek, gemma, glm, internlm, llama, llava, llm, mamba, microsoft, minicpm,
-               mistral, mllm, mplug, openbuddy, qwen, telechat, yi)
+from . import (baai, baichuan, bert, codefuse, deepseek, gemma, glm, internlm, llama, llava, llm, mamba, microsoft,
+               minicpm, minimax, mistral, mllm, moonshot, mplug, openbuddy, qwen, skywork, stepfun, telechat, valley,
+               yi)

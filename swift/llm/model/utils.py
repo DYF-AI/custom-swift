@@ -1,16 +1,14 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import os
-from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from types import MethodType
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypeVar, Union
 
 import torch
-import transformers
 from accelerate.utils import find_device
 from modelscope.hub.utils.utils import get_cache_dir
-from packaging import version
+from torch import nn
 from transformers import PretrainedConfig
 
 from swift.hub import get_hub
@@ -27,6 +25,9 @@ class AttnImpl:
     sdpa = 'sdpa'
     eager = 'eager'
 
+    attn_impl_keys = ['_attn_implementation', 'attn_implementation', 'llm_attn_implementation']
+    use_flash_attn_keys = ['_flash_attn_2_enabled', 'use_flash_attn', '_use_flash_attention_2']
+
     @staticmethod
     def to_use_flash_attn(attn_impl: Optional[str], auto_value: _T = None) -> Union[bool, _T]:
         if attn_impl is None:
@@ -34,18 +35,22 @@ class AttnImpl:
         return attn_impl == AttnImpl.flash_attn
 
     @staticmethod
-    def update_attn_impl(config: PretrainedConfig, attn_impl: Optional[str], auto_value: _T = None) -> None:
-
-        use_flash_attn = AttnImpl.to_use_flash_attn(attn_impl, auto_value)
-        if use_flash_attn is None:
+    def update_attn_impl(config: PretrainedConfig,
+                         attn_impl: Optional[str],
+                         attn_impl_keys: Optional[List[str]] = None) -> None:
+        if attn_impl is None:
             return
-        from swift.llm import HfConfigFactory
-        if version.parse(transformers.__version__) >= version.parse('4.36'):
-            if use_flash_attn:
-                attn_impl = 'flash_attention_2'
-            HfConfigFactory.set_config_attr(config, '_attn_implementation', attn_impl)
-        else:
-            HfConfigFactory.set_config_attr(config, '_flash_attn_2_enabled', use_flash_attn)
+        logger.info(f'attn_impl: {attn_impl}')
+        use_flash_attn = AttnImpl.to_use_flash_attn(attn_impl)
+        if use_flash_attn:
+            attn_impl = 'flash_attention_2'
+        if isinstance(attn_impl_keys, str):
+            attn_impl_keys = [attn_impl_keys]
+        attn_impl_keys = attn_impl_keys or AttnImpl.attn_impl_keys
+        for key in attn_impl_keys:
+            HfConfigFactory.set_config_attr(config, key, attn_impl, ensure_set=False)
+        for key in AttnImpl.use_flash_attn_keys:
+            HfConfigFactory.set_config_attr(config, key, use_flash_attn, ensure_set=False)
 
 
 @dataclass
@@ -58,7 +63,10 @@ class ModelInfo:
     quant_bits: int
 
     # extra
+    rope_scaling: Optional[Dict[str, Any]] = None
     config: Optional[PretrainedConfig] = None
+    task_type: Literal['causal_lm', 'seq_cls', 'embedding', None] = None
+    num_labels: Optional[int] = None
 
     def __post_init__(self):
         from .register import get_model_name
@@ -82,19 +90,27 @@ class HfConfigFactory:
 
     @staticmethod
     def _get_config_attrs(config: Union[PretrainedConfig, Dict[str, Any]],
-                          attr_name: str) -> List[Tuple[PretrainedConfig, Any]]:
+                          attr_name: str,
+                          parent_key: Optional[str] = None) -> List[Tuple[PretrainedConfig, Any]]:
         res = []
-        for key in [None, 'language_config', 'llm_config', 'text_config']:
-            if key is not None:
+        if isinstance(config, dict):
+            keys = config.keys()
+        elif isinstance(config, PretrainedConfig):
+            keys = dir(config)
+        else:
+            return []
+
+        value = deep_getattr(config, attr_name, None)
+        if value is not None and parent_key in [None, 'language_config', 'llm_config', 'text_config']:
+            res.append((config, value))
+
+        for k in keys:
+            if k.endswith('_config'):
                 if isinstance(config, dict):
-                    llm_config = config.get(key)
+                    v = config[k]
                 else:
-                    llm_config = getattr(config, key, None)
-            else:
-                llm_config = config
-            value = deep_getattr(llm_config, attr_name, None)
-            if value is not None:
-                res.append((llm_config, value))
+                    v = getattr(config, k)
+                res += HfConfigFactory._get_config_attrs(v, attr_name, k)
         return res
 
     @staticmethod
@@ -107,16 +123,26 @@ class HfConfigFactory:
             return attrs[0][1]
 
     @staticmethod
-    def set_config_attr(config: Union[PretrainedConfig, Dict[str, Any]], attr_name: str, value: Any) -> None:
+    def set_config_attr(config: Union[PretrainedConfig, Dict[str, Any]],
+                        attr_name: str,
+                        value: Any,
+                        ensure_set: bool = True) -> int:
         """Set all the attr_name attributes to value."""
         attrs = HfConfigFactory._get_config_attrs(config, attr_name)
-        if len(attrs) == 0:
+        if ensure_set and len(attrs) == 0:
             attrs.append((config, None))
         for config, _ in attrs:
             if isinstance(config, dict):
                 config[attr_name] = value
             else:
                 setattr(config, attr_name, value)
+        return len(attrs)
+
+    @staticmethod
+    def set_model_config_attr(model, attr_name: str, value: Any) -> None:
+        for module in model.modules():
+            if getattr(module, 'config', None) and getattr(module.config, attr_name, value) != value:
+                setattr(module.config, attr_name, value)
 
     @staticmethod
     def get_max_model_len(config: Union[PretrainedConfig, Dict[str, Any]]) -> Optional[int]:
@@ -194,37 +220,14 @@ class HfConfigFactory:
 
         return res or None
 
-    @staticmethod
-    def _get_arch_mapping():
-        from .register import MODEL_MAPPING
-        res = {}
-        for model_type, model_meta in MODEL_MAPPING.items():
-            architectures = model_meta.architectures
-            for arch in architectures:
-                if arch not in res:
-                    res[arch] = []
-                res[arch].append(model_type)
-        return res
-
-    @staticmethod
-    def get_matched_model_types(config: Union[PretrainedConfig, Dict[str, Any]]) -> List[str]:
-        """Get possible model_type."""
-        # get possible model_types based on the model architecture.
-        if isinstance(config, dict):
-            arch = config['architectures'][0]
-        else:
-            arch = config.architectures[0]
-
-        arch_mapping = HfConfigFactory._get_arch_mapping()
-        return arch_mapping.get(arch) or []
-
 
 def safe_snapshot_download(model_id_or_path: str,
                            revision: Optional[str] = None,
                            download_model: bool = True,
                            use_hf: Optional[bool] = None,
                            hub_token: Optional[str] = None,
-                           ignore_file_pattern: Optional[List[str]] = None,
+                           ignore_patterns: Optional[List[str]] = None,
+                           check_local: bool = False,
                            **kwargs) -> str:
     """Download model protected by DDP context
 
@@ -237,28 +240,46 @@ def safe_snapshot_download(model_id_or_path: str,
     Returns:
         model_dir
     """
-    if ignore_file_pattern is None:
-        ignore_file_pattern = []
-    ignore_file_pattern += [
-        '*.zip', '*.gguf', '*.pth', '*.pt', 'consolidated*', 'onnx', '*.safetensors.md', '*.msgpack', '*.onnx', '*.ot',
-        '*.h5'
-    ]
+    if check_local:
+        model_suffix = model_id_or_path.rsplit('/', 1)[-1]
+        if os.path.exists(model_suffix):
+            model_dir = os.path.abspath(os.path.expanduser(model_suffix))
+            logger.info(f'Loading the model using local model_dir: {model_dir}')
+            return model_dir
+    if ignore_patterns is None:
+        ignore_patterns = [
+            '*.zip', '*.gguf', '*.pth', '*.pt', 'consolidated*', 'onnx/*', '*.safetensors.md', '*.msgpack', '*.onnx',
+            '*.ot', '*.h5'
+        ]
     if not download_model:
-        ignore_file_pattern += ['*.bin', '*.safetensors']
+        ignore_patterns += ['*.bin', '*.safetensors']
     hub = get_hub(use_hf)
     if model_id_or_path.startswith('~'):
         model_id_or_path = os.path.abspath(os.path.expanduser(model_id_or_path))
     with safe_ddp_context(hash_id=model_id_or_path):
+        model_path_to_check = '/'.join(model_id_or_path.split(':', 1))
         if os.path.exists(model_id_or_path):
             model_dir = model_id_or_path
+            sub_folder = None
+        elif os.path.exists(model_path_to_check):
+            model_dir = model_path_to_check
+            sub_folder = None
         else:
             if model_id_or_path.startswith('/'):  # startswith
                 raise ValueError(f"path: '{model_id_or_path}' not found")
-            model_dir = hub.download_model(model_id_or_path, revision, ignore_file_pattern, token=hub_token, **kwargs)
+            model_id_or_path = model_id_or_path.split(':', 1)  # get sub_folder
+            if len(model_id_or_path) == 1:
+                model_id_or_path = [model_id_or_path[0], None]
+            model_id_or_path, sub_folder = model_id_or_path
+            if sub_folder is not None:
+                kwargs['allow_patterns'] = [f"{sub_folder.rstrip('/')}/*"]
+            model_dir = hub.download_model(model_id_or_path, revision, ignore_patterns, token=hub_token, **kwargs)
 
         logger.info(f'Loading the model using model_dir: {model_dir}')
 
     model_dir = os.path.abspath(os.path.expanduser(model_dir))
+    if sub_folder:
+        model_dir = os.path.join(model_dir, sub_folder)
     assert os.path.isdir(model_dir), f'model_dir: {model_dir}'
     return model_dir
 
@@ -267,6 +288,8 @@ def git_clone_github(github_url: str,
                      local_repo_name: Optional[str] = None,
                      branch: Optional[str] = None,
                      commit_hash: Optional[str] = None) -> str:
+    if github_url.endswith('.git'):
+        github_url = github_url[:-4]
     git_cache_dir = os.path.join(get_cache_dir(), '_github')
     os.makedirs(git_cache_dir, exist_ok=True)
     if local_repo_name is None:
@@ -275,8 +298,7 @@ def git_clone_github(github_url: str,
     local_repo_path = os.path.join(git_cache_dir, local_repo_name)
     with safe_ddp_context(hash_id=local_repo_path):
         if not os.path.exists(local_repo_path):
-            if not github_url.endswith('.git'):
-                github_url = f'{github_url}.git'
+            github_url = f'{github_url}.git'
             command = ['git', '-C', git_cache_dir, 'clone', github_url, local_repo_name]
             command_str = f"git -C '{git_cache_dir}' clone '{github_url}' {local_repo_name}"
             if branch is not None:
@@ -296,11 +318,13 @@ def git_clone_github(github_url: str,
     return local_repo_path
 
 
-def use_submodel_func(model, submodel_name: str, func_list: List[str]) -> None:
+def use_submodel_func(model, submodel_name: str, func_list: Optional[List[str]] = None) -> None:
+    if func_list is None:
+        func_list = ['generate', 'get_input_embeddings', 'gradient_checkpointing_enable', 'forward']
     submodel = getattr(model, submodel_name)
 
     def _get_new_func(func_name: str):
-        _old_func = getattr(submodel.__class__, func_name)
+        _old_func = getattr(submodel, func_name).__func__
 
         @wraps(_old_func)
         def _new_func(self, *args, **kwargs):
@@ -309,8 +333,12 @@ def use_submodel_func(model, submodel_name: str, func_list: List[str]) -> None:
                 device = find_device(args)
                 if device is None:
                     device = find_device(kwargs)
-                res.logits = to_device(res.logits, device)
-                res.loss = to_device(res.loss, device)
+                if hasattr(res, 'logits'):
+                    res.logits = to_device(res.logits, device)
+                if hasattr(res, 'loss'):
+                    res.loss = to_device(res.loss, device)
+                if isinstance(res, dict) and 'last_hidden_state' in res:
+                    res['last_hidden_state'] = to_device(res['last_hidden_state'], device)
             return res
 
         return _new_func
@@ -323,17 +351,101 @@ def use_submodel_func(model, submodel_name: str, func_list: List[str]) -> None:
             setattr(submodel, key, MethodType(_get_new_func(key), submodel))  # fix device_map
 
 
-@contextmanager
-def ignore_check_imports():
-    import transformers.dynamic_module_utils as td
+class InitModelStrategy:
 
-    @wraps(td.check_imports)
-    def _check_imports(filename) -> List[str]:
-        return td.get_relative_imports(filename)
+    @staticmethod
+    def is_uninitialized(param: torch.Tensor) -> bool:
+        """
+        Check if a parameter is uninitialized or has numerically unstable values.
+        Criteria:
+            - Tensor has NaN or Inf values
+            - Tensor stats (mean or std) are outside reasonable range
+        """
+        if param.numel() == 0:
+            return False
 
-    _old_check_imports = td.check_imports
-    td.check_imports = _check_imports
-    try:
-        yield
-    finally:
-        td.check_imports = _old_check_imports
+        with torch.no_grad():
+            mean_abs = param.abs().mean()
+            std = param.std()
+
+            # NaN or Inf
+            if not torch.isfinite(mean_abs) or not torch.isfinite(std):
+                return True
+
+            # Use empirically safe threshold
+            MAX_THRESHOLD = 1e7
+            if mean_abs > MAX_THRESHOLD or std > MAX_THRESHOLD:
+                return True
+
+            return False
+
+    @staticmethod
+    def constant_init(param: torch.Tensor, c: float = 0) -> None:
+        nn.init.constant_(param, c)
+
+    @staticmethod
+    def uniform_init(param: torch.Tensor, a: float = -0.1, b: float = 0.1) -> None:
+        nn.init.uniform_(param, a, b)
+
+    @staticmethod
+    def normal_init(param: torch.Tensor, mean: float = 0.0, std: float = 0.01) -> None:
+        nn.init.normal_(param, mean, std)
+
+    @staticmethod
+    def _init_high_dim(param: torch.Tensor, init_func, *args, **kwargs) -> None:
+        """Helper for high-dimensional initialization methods."""
+        if param.dim() > 1:
+            init_func(param, *args, **kwargs)
+        elif param.dim() == 1 and param.size(0) > 0:
+            InitModelStrategy.constant_init(param)
+
+    @staticmethod
+    def xavier_uniform_init(param: torch.Tensor) -> None:
+        InitModelStrategy._init_high_dim(param, nn.init.xavier_uniform_)
+
+    @staticmethod
+    def xavier_normal_init(param: torch.Tensor) -> None:
+        InitModelStrategy._init_high_dim(param, nn.init.xavier_normal_)
+
+    @staticmethod
+    def kaiming_uniform_init(param: torch.Tensor) -> None:
+        InitModelStrategy._init_high_dim(
+            param, nn.init.kaiming_uniform_, mode='fan_out', nonlinearity='leaky_relu', a=0.1)
+
+    @staticmethod
+    def kaiming_normal_init(param: torch.Tensor) -> None:
+        InitModelStrategy._init_high_dim(param, nn.init.kaiming_normal_, mode='fan_in', nonlinearity='relu')
+
+    @staticmethod
+    def orthogonal_init(param: torch.Tensor) -> None:
+        nn.init.orthogonal_(param, gain=1.0)
+
+    _INIT_STRATEGY_MAP = {
+        'zero': constant_init,
+        'uniform': uniform_init,
+        'normal': normal_init,
+        'xavier_uniform': xavier_uniform_init,
+        'xavier_normal': xavier_normal_init,
+        'kaiming_uniform': kaiming_uniform_init,
+        'kaiming_normal': kaiming_normal_init,
+        'orthogona': orthogonal_init,
+    }
+
+    @staticmethod
+    def init_parameters(model: nn.Module, init_strategy: str) -> None:
+        """Initialize model parameters using the specified strategy.
+        Args:
+            model: The model whose parameters to initialize
+            init_strategy: Name of initialization strategy
+        """
+        if init_strategy not in InitModelStrategy._INIT_STRATEGY_MAP:
+            raise ValueError(f'Unknown initialization strategy: {init_strategy}')
+
+        logger.info(f'initialization strategy: {init_strategy}')
+
+        init_func = InitModelStrategy._INIT_STRATEGY_MAP[init_strategy]
+
+        for name, param in model.named_parameters():
+            if InitModelStrategy.is_uninitialized(param):
+                logger.info(f'Initializing parameters: {name}.')
+                init_func(param)

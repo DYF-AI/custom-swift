@@ -15,6 +15,11 @@
         "hf_dataset_id": "Clinton/texttosqlv2_25000_v2"
     },
     {
+        "ms_dataset_id": "AI-ModelScope/chartqa_digit_r1v_format",
+        "tags": ["grpo"],
+        "hf_dataset_id": "zyang39/chartqa_digit_r1v_format"
+    },
+    {
         "ms_dataset_id": "AI-ModelScope/school_math_0.25M",
         "tags": ["chat", "math", "quality"],
         "hf_dataset_id": "BelleGroup/school_math_0.25M"
@@ -100,7 +105,6 @@
         "ms_dataset_id": "swift/path-vqa",
         "hf_dataset_id": "flaviagiammarino/path-vqa",
         "columns": {
-            "image": "images",
             "question": "query",
             "answer": "response"
         },
@@ -183,8 +187,7 @@
         "hf_dataset_id": "HuggingFaceM4/VQAv2",
         "columns": {
             "question": "query",
-            "multiple_choice_answer": "response",
-            "image": "images"
+            "multiple_choice_answer": "response"
         },
         "split": ["train"],
         "tags": ["en", "vqa", "quality"],
@@ -311,6 +314,10 @@
     },
     {
         "ms_dataset_id": "swift/Infinity-Instruct",
+        "subsets": ["3M", "7M", "0625", "Gen", "7M_domains"],
+        "columns": {
+            "label": "_"
+        },
         "hf_dataset_id": "BAAI/Infinity-Instruct",
         "tags": ["qa", "quality", "multi-task"],
         "huge_dataset": true
@@ -542,14 +549,14 @@
     {
         "ms_dataset_id": "swift/medical_zh",
         "subsets": [{
-            "name": "en",
+            "subset": "en",
             "columns": {
                 "input": "query",
                 "output": "response"
             }
         },
         {
-            "name": "zh",
+            "subset": "zh",
             "columns": {
                 "instruction": "query",
                 "output": "response"
@@ -587,5 +594,119 @@
         "ms_dataset_id": "AI-ModelScope/Magpie-Qwen2-Pro-200K-English",
         "tags": ["chat", "sft", "🔥", "en"],
         "hf_dataset_id": "Magpie-Align/Magpie-Qwen2-Pro-200K-English"
+    },
+    {
+        "ms_dataset_id": "PowerInfer/QWQ-LONGCOT-500K",
+        "tags": ["chat", "sft", "🔥", "cot"],
+        "hf_dataset_id": "PowerInfer/QWQ-LONGCOT-500K"
+    },
+    {
+        "ms_dataset_id": "PowerInfer/LONGCOT-Refine-500K",
+        "tags": ["chat", "sft", "🔥", "cot"],
+        "hf_dataset_id": "PowerInfer/LONGCOT-Refine-500K"
+    },
+    {
+        "ms_dataset_id": "ServiceNow-AI/R1-Distill-SFT",
+        "hf_dataset_id": "ServiceNow-AI/R1-Distill-SFT",
+        "tags": ["chat", "sft", "cot", "r1"],
+        "subsets": [{
+            "subset": "v0",
+            "columns": {
+                "problem": "query",
+                "reannotated_assistant_content": "response"
+            }
+        },
+        {
+            "subset": "v1",
+            "columns": {
+                "messages": "_",
+                "reannotated_messages": "messages"
+            }
+        }]
+    },
+    {
+        "ms_dataset_id": "bespokelabs/Bespoke-Stratos-17k",
+        "hf_dataset_id": "bespokelabs/Bespoke-Stratos-17k",
+        "tags": ["chat", "sft", "cot", "r1"]
+    },
+    {
+        "ms_dataset_id": "open-thoughts/OpenThoughts-114k",
+        "hf_dataset_id": "open-thoughts/OpenThoughts-114k",
+        "tags": ["chat", "sft", "cot", "r1"]
+    },
+    {
+        "ms_dataset_id": "HumanLLMs/Human-Like-DPO-Dataset",
+        "hf_dataset_id": "HumanLLMs/Human-Like-DPO-Dataset",
+        "columns": {
+            "prompt": "query",
+            "chosen": "response",
+            "rejected": "rejected_response"
+        },
+        "tags": ["rlhf", "dpo"]
+    },
+    {
+        "ms_dataset_id": "AI-ModelScope/MATH-lighteval",
+        "hf_dataset_id": "DigitalLearningGmbH/MATH-lighteval",
+        "columns": {
+            "problem": "query"
+        },
+        "tags": ["grpo", "math"]
+    },
+    {
+        "ms_dataset_id": "liucong/Chinese-DeepSeek-R1-Distill-data-110k-SFT",
+        "hf_dataset_id": "Congliu/Chinese-DeepSeek-R1-Distill-data-110k-SFT",
+        "tags": ["chat", "sft", "cot", "r1", "🔥"]
+    },
+    {
+        "ms_dataset_id": "AI-MO/NuminaMath-CoT",
+        "hf_dataset_id": "AI-MO/NuminaMath-CoT",
+        "tags": ["grpo", "math"]
+    },
+    {
+        "ms_dataset_id": "AI-MO/NuminaMath-TIR",
+        "hf_dataset_id": "AI-MO/NuminaMath-TIR",
+        "tags": ["grpo", "math", "🔥"]
+    },
+    {
+        "ms_dataset_id": "AI-MO/NuminaMath-1.5",
+        "hf_dataset_id": "AI-MO/NuminaMath-1.5",
+        "tags": ["grpo", "math"]
+    },
+    {
+        "ms_dataset_id": "FreedomIntelligence/medical-o1-reasoning-SFT",
+        "hf_dataset_id": "FreedomIntelligence/medical-o1-reasoning-SFT",
+        "subsets": ["en", "zh"],
+        "tags": ["medical", "o1", "🔥"]
+    },
+    {
+        "ms_dataset_id": "lmms-lab/multimodal-open-r1-8k-verified",
+        "hf_dataset_id": "lmms-lab/multimodal-open-r1-8k-verified",
+        "tags": ["grpo", "vision", "🔥"]
+    },
+    {
+        "ms_dataset_id": "open-r1/verifiable-coding-problems-python-10k",
+        "hf_dataset_id": "open-r1/verifiable-coding-problems-python-10k",
+        "tags": ["grpo", "code"]
+    },
+    {
+        "ms_dataset_id": "open-r1/verifiable-coding-problems-python",
+        "hf_dataset_id": "open-r1/verifiable-coding-problems-python",
+        "columns": {
+            "problem_statement": "query"
+        },
+        "tags": ["grpo", "code"]
+    },
+    {
+        "ms_dataset_id": "open-r1/verifiable-coding-problems-python-10k_decontaminated",
+        "hf_dataset_id": "open-r1/verifiable-coding-problems-python-10k_decontaminated",
+        "tags": ["grpo", "code"]
+    },
+    {
+        "ms_dataset_id": "open-r1/verifiable-coding-problems-python_decontaminated",
+        "hf_dataset_id": "open-r1/verifiable-coding-problems-python_decontaminated",
+        "columns": {
+            "problem_statement": "query"
+        },
+        "tags": ["grpo", "code"]
     }
 ]

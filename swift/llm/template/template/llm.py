@@ -1,10 +1,13 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
-from ..constant import LLMTemplateType
+from ..constant import LLMTemplateType, MLLMTemplateType
 from ..register import TemplateMeta, register_template
 from ..utils import Prompt
+from .llama import Llama3_2TemplateMeta
+from .qwen import Qwen2VLTemplate, QwenTemplateMeta
 from .utils import DEFAULT_SYSTEM, ChatmlTemplateMeta
 
 register_template(
@@ -28,8 +31,21 @@ register_template(
         default_system=DEFAULT_SYSTEM,
     ))
 
+register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_gme, template_cls=Qwen2VLTemplate, suffix=['<|endoftext|>']))
+
 register_template(
     TemplateMeta(LLMTemplateType.baichuan, prefix=['{{SYSTEM}}'], prompt=[[195], '{{QUERY}}', [196]], chat_sep=[]))
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.baichuan_m1,
+        prefix=[],
+        prompt=['<C_Q>{{QUERY}}<C_A>'],
+        chat_sep=[],
+        suffix=['<C_A>'],
+        system_prefix=['<B_SYS>{{SYSTEM}}'],
+        default_system=DEFAULT_SYSTEM,
+    ))
 
 register_template(
     TemplateMeta(
@@ -46,6 +62,29 @@ register_template(
         prompt=['{{SYSTEM}}\n\n', '{{QUERY}}[/INST]'],
         chat_sep=['</s>[INST] '],
         suffix=['</s>']))
+
+today = datetime.now().strftime('%Y-%m-%d')
+
+mistral_2501_system = (
+    'You are Mistral Small 3, a Large Language Model (LLM) created by Mistral AI, a French startup '
+    'headquartered in Paris.\n'
+    f'Your knowledge base was last updated on 2023-10-01. The current date is {today}.\n\n'
+    "When you're not sure about some information, you say that you don't have the information and don't "
+    'make up anything.\n'
+    "If the user's question is not clear, ambiguous, or does not provide enough context for you to accurately answer "
+    'the question, you do not try to answer it right away and you rather ask the user to clarify their request (e.g. '
+    '"What are some good restaurants around me?" => "Where are you?" or "When is the next flight to Tokyo" => "'
+    'Where do you travel from?")')
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.mistral_2501,
+        prefix=['<s>'],
+        prompt=['[INST]{{QUERY}}[/INST]'],
+        chat_sep=['</s>'],
+        suffix=['</s>'],
+        system_prefix=['<s>[SYSTEM_PROMPT]{{SYSTEM}}[/SYSTEM_PROMPT]'],
+        default_system=mistral_2501_system))
 
 register_template(
     TemplateMeta(
@@ -69,6 +108,17 @@ register_template(
         prompt=['</s><s>[USER]{{QUERY}}[SEP][BOT]'],
         chat_sep=None,
         suffix=['[SEP]</s>']))
+
+register_template(
+    Llama3_2TemplateMeta(
+        LLMTemplateType.skywork_o1,
+        default_system=(
+            'You are Skywork-o1, a thinking model developed by Skywork AI, specializing in solving complex problems '
+            "involving mathematics, coding, and logical reasoning through deep thought. When faced with a user's "
+            'request, you first engage in a lengthy and in-depth thinking process to explore possible solutions to '
+            'the problem. After completing your thoughts, you then provide a detailed explanation of the solution '
+            'process in your response.'),
+    ))
 
 register_template(
     TemplateMeta(
@@ -121,24 +171,17 @@ register_template(
 @dataclass
 class TeleChatTemplateMeta(TemplateMeta):
     prefix: Prompt = field(default_factory=list)
-    prompt: Prompt = field(default_factory=lambda: ['<_user>{{QUERY}}<_bot>'])
-    chat_sep: Optional[Prompt] = field(default_factory=lambda: ['<_end>'])
-    suffix: Prompt = field(default_factory=lambda: ['<_end>'])
-    system_prefix: Optional[Prompt] = field(default_factory=lambda: ['<_system>{{SYSTEM}}'])
+    prompt: Prompt = field(default_factory=lambda: [['user_token_id'], '{{QUERY}}', ['bot_token_id']])
+    chat_sep: Optional[Prompt] = field(default_factory=lambda: [['eos_token_id']])
+    suffix: Prompt = field(default_factory=lambda: [['eos_token_id']])
+    system_prefix: Optional[Prompt] = field(default_factory=lambda: ['<_system>{{SYSTEM}}\n'])
+    auto_add_bos: bool = True
 
 
 register_template(TeleChatTemplateMeta(LLMTemplateType.telechat))
 
-telechat2_system = '你是中国电信星辰语义大模型，英文名是TeleChat，你是由中电信人工智能科技有限公司和中国电信人工智能研究院（TeleAI）研发的人工智能助手。\n'
-register_template(TeleChatTemplateMeta(LLMTemplateType.telechat2, default_system=telechat2_system))
-
-register_template(
-    TemplateMeta(
-        LLMTemplateType.telechat2_115b,
-        prefix=['<_start>'],
-        prompt=[[4], '{{QUERY}}', [5]],
-        chat_sep=['<_end>'],
-        suffix=['<_end>']))
+telechat_system = '你是中国电信星辰语义大模型，英文名是TeleChat，你是由中电信人工智能科技有限公司和中国电信人工智能研究院（TeleAI）研发的人工智能助手。'
+register_template(TeleChatTemplateMeta(LLMTemplateType.telechat2, default_system=telechat_system))
 
 DBRX_SYSTEM = (
     'You are DBRX, created by Databricks. You were last updated in December 2023. '
@@ -219,3 +262,13 @@ register_template(
         suffix=['<|END_OF_TURN_TOKEN|>'],
         default_system=AYA_SYSTEM,
         system_prefix=['<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{{SYSTEM}}<|END_OF_TURN_TOKEN|']))
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.ling,
+        prefix=[],
+        system_prefix=['<role>SYSTEM</role>{{SYSTEM}}'],
+        prompt=['<role>HUMAN</role>{{QUERY}}<role>ASSISTANT</role>'],
+        chat_sep=[],
+        suffix=['<|endoftext|>'],
+    ))

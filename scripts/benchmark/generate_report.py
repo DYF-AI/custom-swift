@@ -92,7 +92,7 @@ class ModelOutput:
         return hyper_params
 
     @property
-    def hyper_paramters(self):
+    def hyper_parameters(self):
         if 'learning_rate' not in self.args:
             return ''
         return f'lr={self.args["learning_rate"]}/' \
@@ -198,7 +198,7 @@ def generate_sft_report(outputs: List[ModelOutput]):
                f'{output.num_trainable_parameters}({output.trainable_parameters_percentage})|' \
                f'{use_flash_attn}|' \
                f'{use_gc}|' \
-               f'{output.hyper_paramters}|' \
+               f'{output.hyper_parameters}|' \
                f'{memory}|' \
                f'{train_speed}|' \
                f'{infer_speed}|' \
@@ -284,7 +284,7 @@ def generate_export_report(outputs: List[ModelOutput]):
 
 
 def parse_output(file):
-    with open(file, 'r') as f:
+    with open(file, 'r', encoding='utf-8') as f:
         content = json.load(f)
 
     name = content['name']

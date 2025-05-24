@@ -2,7 +2,7 @@
 import os
 from typing import List
 
-from swift.llm import ExportArguments, RequestConfig, Template, prepare_pt_engine_template
+from swift.llm import ExportArguments, PtEngine, RequestConfig, Template, prepare_model_template
 from swift.utils import get_logger
 
 logger = get_logger()
@@ -28,14 +28,14 @@ def replace_and_concat(template: 'Template', template_list: List, placeholder: s
 
 
 def export_to_ollama(args: ExportArguments):
+    args.device_map = 'meta'  # Accelerate load speed.
     logger.info('Exporting to ollama:')
-    logger.info('If you have a gguf file, try to pass the file by :--gguf_file /xxx/xxx.gguf, '
-                'else SWIFT will use the original(merged) model dir')
     os.makedirs(args.output_dir, exist_ok=True)
-    pt_engine, template = prepare_pt_engine_template(args)
+    model, template = prepare_model_template(args)
+    pt_engine = PtEngine.from_model_template(model, template)
     logger.info(f'Using model_dir: {pt_engine.model_dir}')
     template_meta = template.template_meta
-    with open(os.path.join(args.output_dir, 'Modelfile'), 'w') as f:
+    with open(os.path.join(args.output_dir, 'Modelfile'), 'w', encoding='utf-8') as f:
         f.write(f'FROM {pt_engine.model_dir}\n')
         f.write(f'TEMPLATE """{{{{ if .System }}}}'
                 f'{replace_and_concat(template, template_meta.system_prefix, "{{SYSTEM}}", "{{ .System }}")}'

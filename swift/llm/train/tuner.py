@@ -1,16 +1,19 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import inspect
 import os
 from typing import List, Union
 
 import torch
+import torch.nn as nn
 import transformers
 from packaging import version
+from transformers import TrainingArguments
 
-from swift.llm import TrainArguments, get_model_arch
+from swift.llm import TrainArguments, deep_getattr, get_model_arch
 from swift.plugin import Tuner, extra_tuners
 from swift.tuners import Swift
-from swift.utils import (activate_parameters, find_all_linears, find_embedding, freeze_parameters, get_logger,
-                         use_torchacc)
+from swift.utils import (activate_parameters, find_all_linears, find_embedding, find_norm, freeze_parameters,
+                         get_logger, use_torchacc)
 
 logger = get_logger()
 
@@ -18,9 +21,9 @@ logger = get_logger()
 def apply_liger(model_type: str):
     from liger_kernel.transformers import (apply_liger_kernel_to_llama, apply_liger_kernel_to_mistral,
                                            apply_liger_kernel_to_mixtral, apply_liger_kernel_to_gemma,
-                                           apply_liger_kernel_to_qwen2, apply_liger_kernel_to_qwen2_vl,
-                                           apply_liger_kernel_to_gemma2, apply_liger_kernel_to_phi3,
-                                           apply_liger_kernel_to_mllama)
+                                           apply_liger_kernel_to_qwen2, apply_liger_kernel_to_qwen3,
+                                           apply_liger_kernel_to_qwen2_vl, apply_liger_kernel_to_qwen2_5_vl,
+                                           apply_liger_kernel_to_phi3, apply_liger_kernel_to_mllama)
     from swift.llm import ModelType
     if model_type in (ModelType.llama, ModelType.llama3, ModelType.llama3_1, ModelType.llama3_2):
         apply_liger_kernel_to_llama()
@@ -28,45 +31,61 @@ def apply_liger(model_type: str):
         apply_liger_kernel_to_mistral()
     elif model_type in (ModelType.mixtral):
         apply_liger_kernel_to_mixtral()
-    elif model_type in (ModelType.gemma):
+    elif model_type in (ModelType.gemma, ModelType.gemma2):
         apply_liger_kernel_to_gemma()
-    elif model_type in (ModelType.gemma2):
+    elif model_type in (ModelType.qwen2, ModelType.qwen2_5):
         apply_liger_kernel_to_qwen2()
+    elif model_type in (ModelType.qwen3):
+        apply_liger_kernel_to_qwen3()
     elif model_type in (ModelType.phi3):
         apply_liger_kernel_to_phi3()
     elif model_type in (ModelType.llama3_2_vision):
         apply_liger_kernel_to_mllama()
     elif model_type in (ModelType.qwen2_vl):
         apply_liger_kernel_to_qwen2_vl()
+    elif model_type in (ModelType.qwen2_5_vl):
+        apply_liger_kernel_to_qwen2_5_vl()
     else:
         raise ValueError(f'Unsupported liger model_type: {model_type}')
 
 
-def get_multimodal_target_regex(args):
-    model_arch = get_model_arch(args.model_meta.model_arch)
+def get_multimodal_target_regex(
+    model,
+    *,
+    freeze_llm: bool = False,
+    freeze_vit: bool = True,
+    freeze_aligner: bool = True,
+    include_embedding: bool = False,
+) -> str:
+    model_arch = get_model_arch(model.model_meta.model_arch)
     modules = []
-    rejected_modules = []
-    if not args.freeze_llm:
+    if not freeze_llm:
         modules += model_arch.language_model
-    if not args.freeze_vit:
+    if not freeze_vit:
         modules += model_arch.vision_tower
-    if args.freeze_aligner:
-        rejected_modules += model_arch.aligner
-    else:
+    if not freeze_aligner:
         modules += model_arch.aligner
+    assert len(modules) > 0, f'modules: {modules}'
 
-    prefix_pattern = '|'.join(modules)
-    rejected_pattern = '|'.join(rejected_modules)
-    # ignore embedding/lm_head
-    ignore_pattern = ['lm_head', 'output', 'emb', 'wte', 'shared']
-    ignore_pattern += model_arch.lm_head or []
-    ignore_pattern += model_arch.embedding or []
-    ignore_pattern = '|'.join(ignore_pattern)
+    extra_layers = []
+    if include_embedding:
+        extra_layers.append(nn.Embedding)
+    res = []
+    for module in modules:
+        rejected_modules = []
+        if not freeze_vit:
+            for aligner in model_arch.aligner:
+                if aligner.startswith(f'{module}.'):
+                    rejected_modules.append(aligner)
 
-    target_regex = f'^({prefix_pattern})(?!.*({ignore_pattern})).*'
-    if rejected_pattern:
-        target_regex = f'(?!^({rejected_pattern}))' + target_regex
-    return target_regex
+        sub_module = deep_getattr(model, module)
+        target_modules = find_all_linears(sub_module, model_arch, extra_layers)
+        target_modules = [tm for tm in target_modules if tm]
+        target_pattern = rf'.*\.({"|".join(target_modules)})' if target_modules else ''
+        rejected_pattern = rf'(?!({"|".join(rejected_modules)}))' if rejected_modules else ''
+        res.append(rf'{rejected_pattern}{module}{target_pattern}')
+
+    return rf'^({"|".join(res)})$'
 
 
 def get_target_modules(args, model) -> Union[str, List[str]]:
@@ -74,16 +93,35 @@ def get_target_modules(args, model) -> Union[str, List[str]]:
     model_meta = model.model_meta
     if isinstance(args.target_modules, str):
         return args.target_modules
-    elif 'all-linear' in args.target_modules:
+    target_modules = args.target_modules.copy()
+    if 'all-linear' in target_modules:
         if model_meta.is_multimodal:
-            return get_multimodal_target_regex(args)
+            return get_multimodal_target_regex(
+                model,
+                freeze_llm=args.freeze_llm,
+                freeze_vit=args.freeze_vit,
+                freeze_aligner=args.freeze_aligner,
+                include_embedding='all-embedding' in target_modules)
         else:
-            target_modules = args.target_modules.copy()
             target_modules.remove('all-linear')
             target_modules += find_all_linears(model)
-    else:
-        target_modules = args.target_modules
+    if 'all-embedding' in target_modules:
+        target_modules.remove('all-embedding')
+        target_modules += find_embedding(model)
     return target_modules
+
+
+def get_modules_to_save(args, model, task_type=None):
+    modules_to_save = args.modules_to_save.copy()
+    if 'all-embedding' in args.modules_to_save:
+        modules_to_save.remove('all-embedding')
+        modules_to_save += find_embedding(model)
+    if 'all-norm' in args.modules_to_save:
+        modules_to_save.remove('all-norm')
+        modules_to_save += find_norm(model)
+    if task_type and task_type.lower() == 'seq_cls':  # reward_model
+        modules_to_save.append('v_head')
+    return modules_to_save
 
 
 def get_vera_target_modules(model, config):
@@ -106,31 +144,57 @@ def get_vera_target_modules(model, config):
     return config
 
 
-def prepare_adapter(args: TrainArguments, model):
+def prepare_adapter(args: TrainArguments, model, *, template=None, train_dataset=None, task_type=None):
     from swift.tuners import (AdaLoraConfig, AdapterConfig, BOFTConfig, LLaMAProConfig, LongLoRAModelType, LoraConfig,
                               LoRAConfig, ReftConfig, Swift, VeraConfig)
+    task_type = (task_type or args.task_type).upper()
     target_modules = get_target_modules(args, model)
+    modules_to_save = get_modules_to_save(args, model, task_type)
     lora_kwargs = {
         'r': args.lora_rank,
         'target_modules': target_modules,
         'lora_alpha': args.lora_alpha,
         'lora_dropout': args.lora_dropout,
         'bias': args.lora_bias,
-        'modules_to_save': args.modules_to_save,
+        'modules_to_save': modules_to_save,
         'use_rslora': args.use_rslora,
         'use_dora': args.use_dora,
         'lorap_lr_ratio': args.lorap_lr_ratio,
         'init_lora_weights': args.init_weights,
     }
-
     if args.train_type in ('lora', 'longlora'):
         if args.use_swift_lora:
             lora_config = LoRAConfig(lora_dtype=args.lora_dtype, **lora_kwargs)
             model = Swift.prepare_model(model, lora_config)
             logger.info(f'lora_config: {lora_config}')
         elif args.tuner_backend == 'peft':
-            lora_config = LoraConfig(task_type='CAUSAL_LM', lora_dtype=args.lora_dtype, **lora_kwargs)
-            model = Swift.prepare_model(model, lora_config)
+            if task_type == 'EMBEDDING':
+                task_type = None
+            lora_config = LoraConfig(task_type=task_type, lora_dtype=args.lora_dtype, **lora_kwargs)
+            if args.init_weights == 'lora-ga':
+                try:
+                    import lora_ga
+                except ImportError as e:
+                    error_message = """
+                    Since 'LoRA-GA' is not implemented by PEFT, you will need to install it directly from GitHub.
+                    Command: 'pip install git+https://github.com/lxline/LoRA-GA.git'.
+                    """
+                    logger.info(error_message)
+                    raise RuntimeError(error_message) from e
+                model = lora_ga.entrypoint.get_lora_ga_model(
+                    model=model,
+                    data_collator=template.data_collator,
+                    dataset=train_dataset,
+                    batch_size=args.lora_ga_batch_size,
+                    num_iters=args.lora_ga_iters,
+                    max_length=args.lora_ga_max_length,
+                    direction=args.lora_ga_direction,
+                    dtype=args.lora_dtype,
+                    scale=args.lora_ga_scale,
+                    stable_gamma=args.lora_ga_stable_gamma,
+                )
+            else:
+                model = Swift.prepare_model(model, lora_config)
             logger.info(f'lora_config: {lora_config}')
         elif args.tuner_backend == 'unsloth':
             if args.resume_from_checkpoint is None:
@@ -142,8 +206,8 @@ def prepare_adapter(args: TrainArguments, model):
                 lora_kwargs.pop('lorap_lr_ratio')
                 model = UnslothModel.get_peft_model(
                     model,
-                    use_gradient_checkpointing=True,
-                    max_seq_length=args.max_length,
+                    use_gradient_checkpointing='unsloth',
+                    max_seq_length=args.max_length or 2048,  # 2048 is the default value of unsloth
                     **lora_kwargs,
                 )
                 logger.info(f'unsloth_config: {lora_kwargs}')
@@ -156,8 +220,9 @@ def prepare_adapter(args: TrainArguments, model):
     elif args.train_type == 'adalora':
         lora_kwargs.pop('lorap_lr_ratio', None)
         lora_kwargs['rank_pattern'] = None
+        from swift.plugin.optimizer import calculate_max_steps
         adalora_config = AdaLoraConfig(
-            task_type='CAUSAL_LM',
+            task_type=task_type,
             **lora_kwargs,
             target_r=args.adalora_target_r,
             init_r=args.adalora_init_r,
@@ -167,6 +232,7 @@ def prepare_adapter(args: TrainArguments, model):
             beta1=args.adalora_beta1,
             beta2=args.adalora_beta2,
             orth_reg_weight=args.adalora_orth_reg_weight,
+            total_step=calculate_max_steps(args.training_args, train_dataset),
         )
         model = Swift.prepare_model(model, adalora_config)
         logger.info(f'adalora_config: {adalora_config}')
@@ -272,73 +338,87 @@ def torchacc_resume_from_checkpoint(args, model):
             logger.warning(f'There were unexpected keys in the checkpoint model loaded: {load_result.unexpected_keys}.')
 
 
-def prepare_model(args: TrainArguments, model):
-    if args.use_liger:
-        # Apply liger
-        apply_liger(args.model_type)
+class TunerMixin:
 
-    if args.is_adapter:
-        # Fix the name of the layer in xcomposer that contains Plora.
-        model.requires_grad_(False)
-        if args.resume_from_checkpoint:
-            if args.train_type in extra_tuners:
-                tuner: Tuner = extra_tuners[args.train_type]
-                model = tuner.from_pretrained(model, args.resume_from_checkpoint)
-            else:
+    @classmethod
+    def prepare_model(cls, args, model, *, template=None, train_dataset=None, task_type=None):
+        if args.use_liger_kernel and 'use_liger_kernel' not in inspect.signature(TrainingArguments).parameters:
+            # Apply liger
+            apply_liger(args.model_type)
+
+        if args.is_adapter:
+            if args.tuner_backend != 'unsloth' and args.train_type not in extra_tuners:
+                # Fix the name of the layer in xcomposer that contains Plora.
+                # Unsloth prepares and loads lora outside this function when
+                # resume_from_checkpoint, so do not disable grad here
+                model.requires_grad_(False)
+            if args.resume_from_checkpoint:
+                if args.train_type in extra_tuners:
+                    tuner: Tuner = extra_tuners[args.train_type]
+                else:
+                    tuner = Swift
                 kwargs = {}
                 if use_torchacc():
                     kwargs = {'adapter_name': 'default'}
-                model = Swift.from_pretrained(model, args.resume_from_checkpoint, is_trainable=True, **kwargs)
-        else:
-            if args.train_type in extra_tuners:
-                tuner: Tuner = extra_tuners[args.train_type]
-                model = tuner.prepare_model(args, model)
+                model = tuner.from_pretrained(model, args.resume_from_checkpoint, is_trainable=True, **kwargs)
             else:
-                model = prepare_adapter(args, model)
-        # fix bug: Attempting to unscale FP16 gradients.
-        #   peft: https://github.com/huggingface/peft/issues/1249
-        for p in model.parameters():
-            if p.requires_grad and p.dtype == torch.float16:
-                logger.info_once('Convert trainable parameters from fp16 to fp32.')
-                p.data = p.data.to(dtype=torch.float32)
-    elif args.train_type == 'full':
-        model.train()
-        model.requires_grad_(True)
+                if args.train_type in extra_tuners:
+                    tuner: Tuner = extra_tuners[args.train_type]
+                    model = tuner.prepare_model(args, model)
+                else:
+                    model = prepare_adapter(
+                        args, model, template=template, train_dataset=train_dataset, task_type=task_type)
+            # fix bug: Attempting to unscale FP16 gradients.
+            #   peft: https://github.com/huggingface/peft/issues/1249
+            for p in model.parameters():
+                if p.requires_grad and p.dtype == torch.float16:
+                    logger.info_once('Convert trainable parameters from fp16 to fp32.')
+                    p.data = p.data.to(dtype=torch.float32)
+        elif args.train_type == 'full':
+            model.train()
+            model.requires_grad_(True)
 
-        freeze_parameters(model, args.freeze_parameters_ratio, args.freeze_parameters)
-        if len(args.trainable_parameters) > 0:
-            activate_parameters(model, args.trainable_parameters)
-        if use_torchacc() and args.resume_from_checkpoint:
-            torchacc_resume_from_checkpoint(args, model)
-    else:
-        raise ValueError(f'args.train_type: {args.train_type}')
+            freeze_parameters(model, args.freeze_parameters_ratio, args.freeze_parameters, args.freeze_parameters_regex)
+            if len(args.trainable_parameters) > 0 or args.trainable_parameters_regex is not None:
+                activate_parameters(model, args.trainable_parameters, args.trainable_parameters_regex)
+            if use_torchacc() and args.resume_from_checkpoint:
+                torchacc_resume_from_checkpoint(args, model)
+        else:
+            raise ValueError(f'args.train_type: {args.train_type}')
 
-    if args.resume_only_model:
-        args.training_args.resume_from_checkpoint = None
-    if args.use_galore:
-        from swift.trainers.optimizers.galore import GaLoreConfig
-        if args.galore_target_modules is None:
-            args.galore_target_modules = find_all_linears(model)
-        if args.galore_with_embedding:
-            args.galore_target_modules += find_embedding(model)
-        args.galore_config = GaLoreConfig(
-            target_modules=args.galore_target_modules,
-            rank=args.galore_rank,
-            update_proj_gap=args.galore_update_proj_gap,
-            galore_scale=args.galore_scale,
-            proj_type=args.galore_proj_type,
-            optim_per_parameter=args.galore_optim_per_parameter,
-            quantize=args.galore_quantization,
-            proj_quant=args.galore_proj_quant,
-            proj_bits=args.galore_proj_bits,
-            proj_group_size=args.galore_proj_group_size,
-            cos_threshold=args.galore_cos_threshold,
-            gamma_proj=args.galore_gamma_proj,
-            queue_size=args.galore_queue_size,
-        )
+        if args.resume_only_model:
+            args.training_args.resume_from_checkpoint = None
+        if args.use_galore:
+            from swift.trainers.optimizers.galore import GaLoreConfig
+            if args.galore_target_modules is None:
+                args.galore_target_modules = find_all_linears(model)
+            if args.galore_with_embedding:
+                args.galore_target_modules += find_embedding(model)
+            args.galore_config = GaLoreConfig(
+                target_modules=args.galore_target_modules,
+                rank=args.galore_rank,
+                update_proj_gap=args.galore_update_proj_gap,
+                galore_scale=args.galore_scale,
+                proj_type=args.galore_proj_type,
+                optim_per_parameter=args.galore_optim_per_parameter,
+                quantize=args.galore_quantization,
+                proj_quant=args.galore_proj_quant,
+                proj_bits=args.galore_proj_bits,
+                proj_group_size=args.galore_proj_group_size,
+                cos_threshold=args.galore_cos_threshold,
+                gamma_proj=args.galore_gamma_proj,
+                queue_size=args.galore_queue_size,
+            )
+            args.training_args.galore_config = args.galore_config
 
-    if args.sequence_parallel_size > 1:
-        from swift.trainers.xtuner import dispatch_module_xtuner
-        dispatch_module_xtuner(model)
+        if args.sequence_parallel_size > 1:
+            from swift.trainers.sequence_parallel import sequence_parallel
+            if hasattr(model, 'model_meta'):
+                is_multimodal = model.model_meta.is_multimodal
+            else:
+                is_multimodal = model.model.model_meta.is_multimodal
+            # multimodal model must do split in basemodel's forward
+            # or the media embedding may occur error
+            sequence_parallel.prepare_model(model, template.tokenizer, split_in_forward=is_multimodal)
 
-    return model
+        return model

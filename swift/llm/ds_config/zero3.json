@@ -12,24 +12,6 @@
         "enabled": "auto"
     },
 
-    "optimizer": {
-        "type": "AdamW",
-        "params": {
-            "lr": "auto",
-            "betas": "auto",
-            "eps": "auto",
-            "weight_decay": "auto"
-        }
-    },
-
-    "scheduler": {
-        "type": "WarmupCosineLR",
-        "params": {
-            "total_num_steps": "auto",
-            "warmup_num_steps": "auto"
-        }
-    },
-
     "zero_optimization": {
         "stage": 3,
         "offload_optimizer": {
@@ -40,10 +22,12 @@
             "device": "none",
             "pin_memory": true
         },
-        "overlap_comm": true,
+        "overlap_comm": false,
         "contiguous_gradients": true,
         "sub_group_size": 1e9,
         "reduce_bucket_size": "auto",
+        "zero_quantized_weights": false,
+        "zero_quantized_gradients": false,
         "stage3_prefetch_bucket_size": "auto",
         "stage3_param_persistence_threshold": "auto",
         "stage3_max_live_parameters": 1e9,

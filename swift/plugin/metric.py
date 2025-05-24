@@ -99,16 +99,13 @@ class MeanMetric(Metric):
         }
 
 
-def compute_nlg_metrics(prediction) -> Dict[str, float]:
+def compute_rouge_bleu(preds: List[str], labels: List[str]):
     import jieba
     from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
     from rouge.rouge import Rouge
-    preds, labels = prediction[0], prediction[1]
     score_dict = {key: MeanMetric() for key in ['rouge-1', 'rouge-2', 'rouge-l', 'bleu-4']}
 
     for pred, label in zip(preds, labels):
-        pred = Serializer.from_tensor(pred)
-        label = Serializer.from_tensor(label)
         hypothesis = list(jieba.cut(pred))
         reference = list(jieba.cut(label))
         if not hypothesis or not reference:
@@ -123,6 +120,15 @@ def compute_nlg_metrics(prediction) -> Dict[str, float]:
     return {k: round(v.compute()['value'] * 100, 6) for k, v in score_dict.items()}
 
 
+def compute_nlg_metrics(prediction) -> Dict[str, float]:
+    preds, labels = prediction[0], prediction[1]
+    new_preds, new_labels = [], []
+    for i in range(preds.shape[0]):
+        new_preds.append(Serializer.from_tensor(preds[i]))
+        new_labels.append(Serializer.from_tensor(labels[i]))
+    return compute_rouge_bleu(new_preds, new_labels)
+
+
 def compute_acc(preds,
                 labels,
                 *,
@@ -130,26 +136,24 @@ def compute_acc(preds,
                 is_encoder_decoder: bool = False) -> Dict[str, List[float]]:
 
     if isinstance(preds, torch.Tensor):
+        if torch.is_floating_point(labels):
+            return {}
         preds = preds.cpu().numpy()
         labels = labels.cpu().numpy()
-
-    if is_encoder_decoder:
-        labels = labels[..., :]
-        preds = preds[..., :]
-    else:
+    if preds.ndim >= 2 and not is_encoder_decoder:
         labels = labels[..., 1:]
         preds = preds[..., :-1]
-    if preds.shape != labels.shape:
+    if np.issubdtype(labels.dtype, np.floating) or preds.shape != labels.shape:
         return {}
 
     masks = labels != -100
-    if acc_strategy == 'seq':
+    if acc_strategy == 'token' or preds.ndim == 1:
+        acc_list = (preds[masks] == labels[masks]).tolist()
+    else:
         acc_list = []
         for i, m in enumerate(masks):
             acc_list.append(np.all(preds[i, m] == labels[i, m]))
-    else:
-        acc_list = (preds[masks] == labels[masks]).tolist()
-    return {f'{acc_strategy}_acc': acc_list}
+    return {f'{acc_strategy}_acc' if preds.ndim >= 2 else 'acc': acc_list}
 
 
 def compute_acc_metrics(eval_prediction: EvalPrediction,

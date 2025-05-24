@@ -1,49 +1,40 @@
 # Quick Start
 
-SWIFT is an integrated framework that encompasses model training, inference deployment, evaluation, and quantization, allowing model developers to meet various needs around their models in one-stop within the SWIFT framework. Currently, the main capabilities of SWIFT include:
+ms-swift is a comprehensive training and deployment framework for large language models and multimodal large models, provided by the ModelScope Community. It currently supports the training (CPT, SFT, RLHF), inference, evaluation, quantization, and deployment of 500+ LLM and 200+ MLLM. Model developers can fulfill all kinds of needs related to large models in a single platform within the ms-swift framework. The main capabilities of ms-swift include:
 
-- Model Types: Supporting training and post-training for large models ranging from pure text models, multi-modal large models, to All-to-All fully modal models.
-- Dataset Types: Covering pure text datasets, multi-modal datasets, and text-to-image datasets, suitable for different tasks.
-- Task Types: Besides general generative tasks, it supports training for classification tasks.
-- Lightweight Fine-tuning: Supports various lightweight fine-tuning methods such as LoRA, QLoRA, DoRA, ReFT, LLaMAPro, Adapter, SCEdit, GaLore, and Liger-Kernel.
-- Training stages: Covering the entire stages of pre-training, fine-tuning, and human alignment.
-- Training Parallelism: Covers single machine single card, single machine multiple card device mapping, distributed data parallelism (DDP), multi-machine multi-card, DeepSpeed, FSDP, PAI DLC, and supports training for models based on the Megatron architecture.
-  - Extra support for [TorchAcc](https://github.imc.re/AlibabaPAI/torchacc) training acceleration.
-  - Extra support for sequence parallelism based on [XTuner](https://github.com/InternLM/xtuner).
-- Inference Deployment: Supports inference deployment on multiple frameworks such as PyTorch, vLLM, LmDeploy, which can be directly applied in Docker images or Kubernetes environments.
-- Evaluation: Supports pure text and multi-modal evaluation capabilities based on the EvalScope framework, and allows for customized evaluation.
-- Export: Supports quantization methods like awq, gptq, bnb, and operations for merging lora and llamapro.
-- User Interface: Supports interface operations based on the Gradio framework and allows for the deployment of single model applications in space or demo environments.
-- Plug-in System: Supports customizable definitions for loss, metrics, trainer, loss-scale, callback, optimizer, etc., making it easier for users to customize the training process.
+- 🍎 Model Types: Supports 500+ pure text large models, 200+ multi-modal large models, as well as All-to-All multi-modal models, sequence classification models, and embedding models, covering the entire process from training to deployment.
+- Dataset Types: Comes with more than 150 pre-built datasets for pre-training, fine-tuning, human alignment, multimodal, and supports custom datasets.
+- Hardware Support: Compatible with CPU, RTX series, T4/V100, A10/A100/H100, Ascend NPU, MPS and others.
+- 🍊 Lightweight Training: Supports lightweight fine-tuning methods like LoRA, QLoRA, DoRA, LoRA+, ReFT, RS-LoRA, LLaMAPro, Adapter, GaLore, Q-Galore, LISA, UnSloth, Liger-Kernel, and more.
+- Distributed Training: Supports distributed data parallel (DDP), simple model parallelism via device_map, DeepSpeed ZeRO2 ZeRO3, FSDP, and other distributed training technologies.
+- Quantization Training: Provides training for quantized models like BNB, AWQ, GPTQ, AQLM, HQQ, EETQ.
+- RLHF Training: Supports human alignment training methods like DPO, GRPO, RM, PPO, KTO, CPO, SimPO, ORPO for both text-based and multimodal large models.
+- 🍓 Multimodal Training: Capable of training models for different modalities such as images, videos, and audios; supports tasks like VQA (Visual Question Answering), Captioning, OCR (Optical Character Recognition), and Grounding.
+- Interface-driven Training: Offers training, inference, evaluation, and quantization capabilities through an interface, enabling a complete workflow for large models.
+- Plugins and Extensions: Allows customization and extension of models and datasets, and supports customizations for components like loss, metric, trainer, loss-scale, callback, optimizer, etc.
+- 🍉 Toolbox Capabilities: Offers not only training support for large models and multi-modal large models but also covers the entire process of inference, evaluation, quantization, and deployment.
+- Inference Acceleration: Supports inference acceleration engines like PyTorch, vLLM, LmDeploy, and provides OpenAI interface, accelerating inference, deployment, and evaluation modules.
+- Model Evaluation: Uses EvalScope as the evaluation backend and supports evaluation of text-based and multimodal models with over 100 evaluation datasets.
+- Model Quantization: Supports the export of quantized models in AWQ, GPTQ, and BNB formats, which can be accelerated using vLLM/LmDeploy for inference and support continued training.
 
 ## Installation
 
-Installing SWIFT is straightforward. Please refer to the [installation documentation](./SWIFT-installation.md).
-
-## Some Key Concepts
-
-### Model Type
-
-In SWIFT 3.0, the model_type is different from that in 2.0. The model_type in 3.x refers to a collection of models that share the following identical characteristics:
-1. The same model architecture, such as the typical LLaMA structure.
-2. The same template, such as those using the chatml format.
-3. The same model loading method, like using get_model_tokenizer_flash_attn.
-
-When all three points are identical, the models are classified into one group, and the type of this group is referred to as model_type.
+For the installation of ms-swift, please refer to the [installation documentation](./SWIFT-installation.md).
 
 ## Usage Example
 
-Comprehensive usage examples can be found in the [examples](https://github.com/modelscope/ms-swift/tree/main/examples) section. Below are some basic examples:
+10 minutes of self-cognition fine-tuning of Qwen2.5-7B-Instruct on a single 3090 GPU:
 
-Command line method for LoRA training.
 ```shell
+# 22GB
 CUDA_VISIBLE_DEVICES=0 \
 swift sft \
     --model Qwen/Qwen2.5-7B-Instruct \
     --train_type lora \
-    --dataset AI-ModelScope/alpaca-gpt4-data-zh#500 \
-              AI-ModelScope/alpaca-gpt4-data-en#500 \
-              swift/self-cognition#500 \
+    --dataset 'AI-ModelScope/alpaca-gpt4-data-zh#500' \
+              'AI-ModelScope/alpaca-gpt4-data-en#500' \
+              'swift/self-cognition#500' \
+    --torch_dtype bfloat16 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
@@ -65,68 +56,50 @@ swift sft \
     --model_name swift-robot
 ```
 
-You can check examples of training using code at [examples/notebook](https://github.com/modelscope/ms-swift/tree/main/examples/notebook).
+Tips:
 
-Inference and deployment using the command line
+- If you want to train with a custom dataset, you can refer to [this guide](../Customization/Custom-dataset.md) to organize your dataset format and specify `--dataset <dataset_path>`.
+- The `--model_author` and `--model_name` parameters are only effective when the dataset includes `swift/self-cognition`.
+- To train with a different model, simply modify `--model <model_id/model_path>`.
+- By default, ModelScope is used for downloading models and datasets. If you want to use HuggingFace, simply specify `--use_hf true`.
+
+After training is complete, use the following command to infer with the trained weights:
+
+- Here, `--adapters` should be replaced with the last checkpoint folder generated during training. Since the adapters folder contains the training parameter file `args.json`, there is no need to specify `--model`, `--system` separately; Swift will automatically read these parameters. To disable this behavior, you can set `--load_args false`.
+
 ```shell
-# Inference
+# Using an interactive command line for inference.
 CUDA_VISIBLE_DEVICES=0 \
 swift infer \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --infer_backend pt
-```
+    --adapters output/vx-xxx/checkpoint-xxx \
+    --stream true \
+    --temperature 0 \
+    --max_new_tokens 2048
 
-```shell
-# Deployment
+# merge-lora and use vLLM for inference acceleration
 CUDA_VISIBLE_DEVICES=0 \
-swift deploy \
-    --model Qwen/Qwen2-7B-Instruct \
-    --infer_backend pt
+swift infer \
+    --adapters output/vx-xxx/checkpoint-xxx \
+    --stream true \
+    --merge_lora true \
+    --infer_backend vllm \
+    --max_model_len 8192 \
+    --temperature 0 \
+    --max_new_tokens 2048
 ```
 
-```python
-# Client-side deployment code
-from openai import OpenAI
+Finally, use the following command to push the model to ModelScope:
 
-client = OpenAI(
-    api_key='EMPTY',
-    base_url='http://localhost:8000/v1',
-)
-model_type = client.models.list().data[0].id
-print(f'model_type: {model_type}')
-
-query = 'Where is the capital of Zhejiang?'
-messages = [{'role': 'user', 'content': query}]
-resp = client.chat.completions.create(model=model_type, messages=messages, seed=42)
-response = resp.choices[0].message.content
-print(f'query: {query}')
-print(f'response: {response}')
-
-# Streaming
-messages.append({'role': 'assistant', 'content': response})
-query = 'What delicious food is there?'
-messages.append({'role': 'user', 'content': query})
-stream_resp = client.chat.completions.create(model=model_type, messages=messages, stream=True, seed=42)
-
-print(f'query: {query}')
-print('response: ', end='')
-for chunk in stream_resp:
-    print(chunk.choices[0].delta.content, end='', flush=True)
-print()
-```
-
-## Evaluation
 ```shell
-swift eval \
-  --model Qwen/Qwen2-7B-Instruct \
-  --eval_limit 10 \
-  --eval_dataset gsm8k
-```
-
-## Quantization
-```shell
+CUDA_VISIBLE_DEVICES=0 \
 swift export \
-  --model Qwen/Qwen2-7B-Instruct \
-  --quant_method bnb \
-  --quant_bits 8
+    --adapters output/vx-xxx/checkpoint-xxx \
+    --push_to_hub true \
+    --hub_model_id '<your-model-id>' \
+    --hub_token '<your-sdk-token>' \
+    --use_hf false
 ```
+
+## Learn More
+- More Shell scripts: [https://github.com/modelscope/ms-swift/tree/main/examples](https://github.com/modelscope/ms-swift/tree/main/examples)
+- Using Python: [https://github.com/modelscope/ms-swift/blob/main/examples/notebook/qwen2_5-self-cognition/self-cognition-sft.ipynb](https://github.com/modelscope/ms-swift/blob/main/examples/notebook/qwen2_5-self-cognition/self-cognition-sft.ipynb)

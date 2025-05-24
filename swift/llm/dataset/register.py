@@ -46,10 +46,11 @@ class DatasetMeta:
     ms_dataset_id: Optional[str] = None
     hf_dataset_id: Optional[str] = None
     dataset_path: Optional[str] = None
+    dataset_name: Optional[str] = None
     ms_revision: Optional[str] = None
     hf_revision: Optional[str] = None
 
-    subsets: List[Union[SubsetDataset, str]] = field(default_factory=lambda: [SubsetDataset()])
+    subsets: List[Union[SubsetDataset, str]] = field(default_factory=lambda: ['default'])
     # Applicable to all subsets.
     split: List[str] = field(default_factory=lambda: ['train'])
     # First perform column mapping, then proceed with the preprocess_func.
@@ -91,24 +92,27 @@ def register_dataset(dataset_meta: DatasetMeta, *, exist_ok: bool = False) -> No
         dataset_meta: The `DatasetMeta` info of the dataset.
         exist_ok: If the dataset id exists, raise error or update it.
     """
-    dataset_id = dataset_meta.ms_dataset_id, dataset_meta.hf_dataset_id, dataset_meta.dataset_path
-    if not exist_ok and dataset_id in DATASET_MAPPING:
-        raise ValueError(f'The `{dataset_id}` has already been registered in the DATASET_MAPPING.')
+    if dataset_meta.dataset_name:
+        dataset_name = dataset_meta.dataset_name
+    else:
+        dataset_name = dataset_meta.ms_dataset_id, dataset_meta.hf_dataset_id, dataset_meta.dataset_path
+    if not exist_ok and dataset_name in DATASET_MAPPING:
+        raise ValueError(f'The `{dataset_name}` has already been registered in the DATASET_MAPPING.')
 
-    DATASET_MAPPING[dataset_id] = dataset_meta
+    DATASET_MAPPING[dataset_name] = dataset_meta
 
 
 def _preprocess_d_info(d_info: Dict[str, Any], *, base_dir: Optional[str] = None) -> Dict[str, Any]:
     d_info = deepcopy(d_info)
 
-    columns_mapping = None
+    columns = None
     if 'columns' in d_info:
-        columns_mapping = d_info.pop('columns')
+        columns = d_info.pop('columns')
 
     if 'messages' in d_info:
-        d_info['preprocess_func'] = MessagesPreprocessor(**d_info.pop('messages'), columns_mapping=columns_mapping)
+        d_info['preprocess_func'] = MessagesPreprocessor(**d_info.pop('messages'), columns=columns)
     else:
-        d_info['preprocess_func'] = AutoPreprocessor(columns_mapping=columns_mapping)
+        d_info['preprocess_func'] = AutoPreprocessor(columns=columns)
 
     if 'dataset_path' in d_info:
         dataset_path = d_info.pop('dataset_path')
@@ -157,7 +161,7 @@ def register_dataset_info(dataset_info: Union[str, List[str], None] = None) -> L
         if os.path.isfile(dataset_path):
             log_msg = dataset_path
             base_dir = os.path.dirname(dataset_path)
-            with open(dataset_path, 'r') as f:
+            with open(dataset_path, 'r', encoding='utf-8') as f:
                 dataset_info = json.load(f)
         else:
             dataset_info = json.loads(dataset_info)  # json
@@ -169,5 +173,5 @@ def register_dataset_info(dataset_info: Union[str, List[str], None] = None) -> L
 
     if log_msg is None:
         log_msg = dataset_info if len(dataset_info) < 5 else list(dataset_info.keys())
-    logger.info(f'Successfully registered `{log_msg}`')
+    logger.info(f'Successfully registered `{log_msg}`.')
     return res

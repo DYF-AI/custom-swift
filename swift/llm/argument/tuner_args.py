@@ -29,6 +29,18 @@ class TunerArguments:
         use_rslora (bool): Flag to indicate if RSLora is used. Default is False.
         use_dora (bool): Flag to indicate if Dora is used. Default is False.
         init_weights (str): Initialization method for weights of supported tuners. Default is 'true'.
+        lora_ga_batch_size (int): Batch size used for estimating gradients during initialization in LoRA-GA.
+                                    Default value is 2.
+        lora_ga_iters (int): Number of iterations for estimating gradients during initialization in LoRA-GA.
+                                Default value is 2.
+        lora_ga_max_length (int): Maximum input length for estimating gradients during initialization in LoRA-GA.
+                                    Default value is 1024.
+        lora_ga_direction (str): Initial direction used for gradient estimation during initialization in LoRA-GA.
+                                    Default value is `ArB2r`. Allowed: `ArBr`, `A2rBr`, `ArB2r`, and `random`.
+        lora_ga_scale (str): The scaling method for initialization in LoRA-GA.
+                                Default value is `stable`. Allowed values are: `gd`, `unit`, `stable`, and `weightS`.
+        lora_ga_stable_gamma (int): The gamma value when choosing `stable` scaling for initialization.
+                                    Default value is 16.
 
         fourier_n_frequency (int): Number of frequencies for FourierFT. Default is 2000.
         fourier_scaling (float): Scaling factor for FourierFT. Default is 300.0.
@@ -83,17 +95,17 @@ class TunerArguments:
         reft_rank (int): Rank parameter for ReFT. Default is 4.
         reft_intervention_type (Literal): Type of intervention for ReFT. Default is 'LoreftIntervention'.
         reft_args (Optional[str]): Additional arguments for ReFT. Default is None.
-
-        use_liger (bool): Flag to indicate if Liger-kernel is used. Default is False.
     """
     # full
     freeze_parameters: List[str] = field(default_factory=list)
+    freeze_parameters_regex: Optional[str] = None
     freeze_parameters_ratio: float = 0.  # 0 ~ 1
     trainable_parameters: List[str] = field(default_factory=list)
+    trainable_parameters_regex: Optional[str] = None
     # lora or full
+    freeze_llm: bool = False
     freeze_vit: bool = True
     freeze_aligner: bool = True
-    freeze_llm: bool = False
     # tuners
     target_modules: List[str] = field(default_factory=lambda: ['all-linear'])
     target_regex: Optional[str] = None
@@ -109,7 +121,13 @@ class TunerArguments:
     lorap_lr_ratio: Optional[float] = None
     use_rslora: bool = False
     use_dora: bool = False
-    # Lora: Literal['gaussian', 'pissa', 'pissa_niter_[number of iters]', 'olora', 'loftq', 'true', 'false']
+    # Lora: Literal['gaussian', 'pissa', 'pissa_niter_[number of iters]', 'olora', 'loftq', 'true', 'false', 'lora-ga']
+    lora_ga_batch_size: int = 2
+    lora_ga_iters: int = 2
+    lora_ga_max_length: int = 1024
+    lora_ga_direction: str = 'ArB2r'
+    lora_ga_scale: str = 'stable'
+    lora_ga_stable_gamma: int = 16
 
     # Bone: Literal['bat', 'true', 'false']
     init_weights: str = 'true'
@@ -178,9 +196,6 @@ class TunerArguments:
                                     'NodireftIntervention'] = 'LoreftIntervention'
     reft_args: Optional[str] = None
 
-    # use_liger
-    use_liger: bool = False
-
     def __post_init__(self):
         if isinstance(self.init_weights, str) and self.init_weights.lower() in {'true', 'false'}:
             self.init_weights = bool(strtobool(self.init_weights))
@@ -189,9 +204,9 @@ class TunerArguments:
             self.target_modules = self.target_regex
 
     def _init_multimodal_full(self):
-        if not self.model_meta.is_multimodal:
-            return
         model_arch = get_model_arch(self.model_meta.model_arch)
+        if not self.model_meta.is_multimodal or not model_arch:
+            return
         if self.freeze_llm:
             self.freeze_parameters += model_arch.language_model
         if self.freeze_vit:
@@ -204,4 +219,4 @@ class TunerArguments:
         if self.freeze_parameters:
             logger.info(f'freeze_parameters: {self.freeze_parameters}')
         if self.trainable_parameters:
-            logger.info(f'trainable_parameters: {self.trainable_parameters}')
+            logger.info(f'additional trainable_parameters: {self.trainable_parameters}')

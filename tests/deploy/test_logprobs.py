@@ -51,11 +51,10 @@ def _test_client(port: int, print_logprobs: bool = False, test_vlm: bool = False
 
     request_config = RequestConfig(
         stream=True, seed=42, max_tokens=256, temperature=0.8, top_k=20, top_p=0.8, logprobs=True, top_logprobs=5)
-    stream_resp = infer_client.infer([infer_request], request_config=request_config)
+    gen_list = infer_client.infer([infer_request], request_config=request_config)
     print(f'query: {query}')
     print('response: ', end='')
-    for chunk in stream_resp:
-        chunk = chunk[0]
+    for chunk in gen_list[0]:
         print(chunk.choices[0].delta.content, end='', flush=True)
         if print_logprobs and chunk.choices[0].logprobs is not None:
             pprint(chunk.choices[0].logprobs)
@@ -70,7 +69,7 @@ def _test(infer_backend, test_vlm: bool = False):
     from swift.llm import deploy_main
     import multiprocessing
     mp = multiprocessing.get_context('spawn')
-    model = 'qwen/Qwen2-VL-7B-Instruct' if test_vlm else 'qwen/Qwen2-7B-Instruct'
+    model = 'Qwen/Qwen2-VL-7B-Instruct' if test_vlm else 'Qwen/Qwen2-7B-Instruct'
     args = DeployArguments(model=model, infer_backend=infer_backend, verbose=False)
     process = mp.Process(target=deploy_main, args=(args, ))
     process.start()
@@ -94,20 +93,20 @@ def test_pt():
     _test('pt')
 
 
-def test_vllm_orgin():
+def test_vllm_origin():
     import os
     import subprocess
     import sys
     from modelscope import snapshot_download
-    model_dir = snapshot_download('qwen/Qwen2-7B-Instruct')
+    model_dir = snapshot_download('Qwen/Qwen2-7B-Instruct')
     args = [sys.executable, '-m', 'vllm.entrypoints.openai.api_server', '--model', model_dir]
     process = subprocess.Popen(args)
-    _test_client()
+    _test_client(8000)
     process.terminate()
 
 
 if __name__ == '__main__':
-    # test_vllm_orgin()
+    # test_vllm_origin()
     # test_vllm()
     test_vllm_vlm()
     # test_lmdeploy()

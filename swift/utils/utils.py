@@ -1,8 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import datetime as dt
+import fnmatch
+import glob
+import importlib
 import os
 import random
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -13,6 +17,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from transformers import HfArgumentParser, enable_full_determinism, set_seed
+from transformers.utils import strtobool
 
 from .env import is_dist, is_dist_ta
 from .logger import get_logger
@@ -37,7 +42,7 @@ def check_json_format(obj: Any, token_safe: bool = True) -> Any:
     elif isinstance(obj, Mapping):
         res = {}
         for k, v in obj.items():
-            if token_safe and isinstance(k, str) and '_token' in k:
+            if token_safe and isinstance(k, str) and '_token' in k and isinstance(v, str):
                 res[k] = None
             else:
                 res[k] = check_json_format(v, token_safe)
@@ -223,6 +228,8 @@ def get_env_args(args_name: str, type_func: Callable[[str], _T], default_value: 
         log_info = (f'Setting {args_name}: {default_value}. '
                     f'You can adjust this hyperparameter through the environment variable: `{args_name_upper}`.')
     else:
+        if type_func is bool:
+            value = strtobool(value)
         value = type_func(value)
         log_info = f'Using environment variable `{args_name_upper}`, Setting {args_name}: {value}.'
     logger.info_once(log_info)
@@ -235,12 +242,52 @@ def find_free_port(start_port: Optional[int] = None, retry: int = 100) -> int:
     for port in range(start_port, start_port + retry):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
-                sock.bind(('', start_port))
+                sock.bind(('', port))
                 port = sock.getsockname()[1]
                 break
             except OSError:
                 pass
     return port
+
+
+def copy_files_by_pattern(source_dir, dest_dir, patterns):
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+
+    if isinstance(patterns, str):
+        patterns = [patterns]
+
+    for pattern in patterns:
+        pattern_parts = pattern.split(os.path.sep)
+        if len(pattern_parts) > 1:
+            subdir_pattern = os.path.sep.join(pattern_parts[:-1])
+            file_pattern = pattern_parts[-1]
+
+            for root, dirs, files in os.walk(source_dir):
+                rel_path = os.path.relpath(root, source_dir)
+                if rel_path == '.' or (rel_path != '.' and not fnmatch.fnmatch(rel_path, subdir_pattern)):
+                    continue
+
+                for file in files:
+                    if fnmatch.fnmatch(file, file_pattern):
+                        file_path = os.path.join(root, file)
+                        target_dir = os.path.join(dest_dir, rel_path)
+                        if not os.path.exists(target_dir):
+                            os.makedirs(target_dir)
+                        dest_file = os.path.join(target_dir, file)
+
+                        if not os.path.exists(dest_file):
+                            shutil.copy2(file_path, dest_file)
+        else:
+            search_path = os.path.join(source_dir, pattern)
+            matched_files = glob.glob(search_path)
+
+            for file_path in matched_files:
+                if os.path.isfile(file_path):
+                    file_name = os.path.basename(file_path)
+                    destination = os.path.join(dest_dir, file_name)
+                    if not os.path.exists(destination):
+                        shutil.copy2(file_path, destination)
 
 
 def split_list(ori_list, num_shards):
@@ -249,3 +296,28 @@ def split_list(ori_list, num_shards):
     for i in range(len(idx_list) - 1):
         shard.append(ori_list[int(idx_list[i]):int(idx_list[i + 1])])
     return shard
+
+
+def patch_getattr(obj_cls, item_name: str):
+    if hasattr(obj_cls, '_patch'):  # avoid double patch
+        return
+
+    def __new_getattr__(self, key: str):
+        try:
+            return super(self.__class__, self).__getattr__(key)
+        except AttributeError:
+            if item_name in dir(self):
+                item = getattr(self, item_name)
+                return getattr(item, key)
+            raise
+
+    obj_cls.__getattr__ = __new_getattr__
+    obj_cls._patch = True
+
+
+def import_external_file(file_path: str):
+    file_path = os.path.abspath(os.path.expanduser(file_path))
+    py_dir, py_file = os.path.split(file_path)
+    assert os.path.isdir(py_dir), f'py_dir: {py_dir}'
+    sys.path.insert(0, py_dir)
+    return importlib.import_module(py_file.split('.', 1)[0])

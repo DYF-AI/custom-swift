@@ -11,24 +11,25 @@ Swift DOCUMENTATION
 
    GetStarted/SWIFT-installation.md
    GetStarted/Quick-start.md
-   GetStarted/Interface-usage.md
+   GetStarted/Web-UI.md
 
 .. toctree::
    :maxdepth: 2
    :caption: Instruction
 
+   Instruction/Command-line-parameters.md
    Instruction/Pre-training-and-Fine-tuning.md
    Instruction/RLHF.md
    Instruction/Inference-and-deployment.md
+   Instruction/Megatron-SWIFT-Training.md
+   Instruction/Sample.md
    Instruction/Evaluation.md
-   Instruction/Export.md
-   Instruction/Command-line-parameters.md
+   Instruction/Export-and-push.md
+   Instruction/Reinforced-Fine-tuning.md
+   Instruction/GRPO.md
+   Instruction/Agent-support.md
    Instruction/Supported-models-and-datasets.md
    Instruction/Use-tuners.md
-   Instruction/Agent-support.md
-   Instruction/NPU-support.md
-   Instruction/Push-model.md
-   Instruction/ReleaseNote3.0
    Instruction/Frequently-asked-questions.md
 
 
@@ -36,10 +37,22 @@ Swift DOCUMENTATION
    :maxdepth: 2
    :caption: Customization
 
-   Customization/New-dataset.md
-   Customization/New-model.md
-   Customization/Plugin.md
+   Customization/Custom-model.md
+   Customization/Custom-dataset.md
+   Customization/Pluginization.md
 
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Best Practices
+
+   BestPractices/GRPO.md
+   BestPractices/GRPO-Multi-Modal-Training.md
+   BestPractices/GRPO-Code-Training.md
+   BestPractices/Embedding.md
+   BestPractices/Rapidly-Training-VL-model.md
+   BestPractices/NPU-support.md
+   BestPractices/More-Best-Practices.md
 
 Indices and tables
 ==================

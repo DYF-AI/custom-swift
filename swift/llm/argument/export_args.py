@@ -1,9 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional
 
-from swift.utils import get_logger
+import torch
+import torch.distributed as dist
+
+from swift.utils import get_logger, init_process_group, set_default_ddp_config
 from .base_args import BaseArguments, to_abspath
 from .merge_args import MergeArguments
 
@@ -21,7 +24,6 @@ class ExportArguments(MergeArguments, BaseArguments):
         max_length (int): Sequence length for quantization.
         quant_batch_size (int): Batch size for quantization.
         to_ollama (bool): Flag to indicate export model to ollama format.
-        gguf_file (Optional[str]): Path to the GGUF file when exporting to ollama format.
         push_to_hub (bool): Flag to indicate if the output should be pushed to the model hub.
         hub_model_id (Optional[str]): Model ID for the hub.
         hub_private_repo (bool): Flag to indicate if the hub repository is private.
@@ -29,7 +31,6 @@ class ExportArguments(MergeArguments, BaseArguments):
         to_peft_format (bool): Flag to indicate if the output should be in PEFT format.
             This argument is useless for now.
     """
-    ckpt_dir: Optional[str] = field(default=None, metadata={'help': '/path/to/your/vx-xxx/checkpoint-xxx'})
     output_dir: Optional[str] = None
 
     # awq/gptq
@@ -41,7 +42,13 @@ class ExportArguments(MergeArguments, BaseArguments):
 
     # ollama
     to_ollama: bool = False
-    gguf_file: Optional[str] = None
+
+    # megatron
+    to_mcore: bool = False
+    to_hf: bool = False
+    mcore_model: Optional[str] = None
+    thread_count: Optional[int] = None
+    test_convert_precision: bool = False
 
     # push to ms hub
     push_to_hub: bool = False
@@ -51,53 +58,50 @@ class ExportArguments(MergeArguments, BaseArguments):
     commit_message: str = 'update files'
     # compat
     to_peft_format: bool = False
-
-    def _init_quant(self):
-
-        if self.quant_bits:
-            if self.quant_method is None:
-                raise ValueError('Please specify the quantization method using `--quant_method awq/gptq`.')
-            if len(self.dataset) == 0 and self.quant_method in {'gptq', 'awq'}:
-                raise ValueError(f'self.dataset: {self.dataset}, Please input the quant dataset.')
+    exist_ok: bool = False
 
     def _init_output_dir(self):
-        suffix = None
         if self.output_dir is None:
             ckpt_dir = self.ckpt_dir or f'./{self.model_suffix}'
             ckpt_dir, ckpt_name = os.path.split(ckpt_dir)
             if self.to_peft_format:
                 suffix = 'peft'
-            elif self.merge_lora:
-                suffix = 'merged'
-            elif self.quant_bits:
+            elif self.quant_method:
                 suffix = f'{self.quant_method}-int{self.quant_bits}'
             elif self.to_ollama:
                 suffix = 'ollama'
+            elif self.merge_lora:
+                suffix = 'merged'
+            elif self.to_mcore:
+                suffix = 'mcore'
+            elif self.to_hf:
+                suffix = 'hf'
             else:
-                suffix = 'dummy'
-                logger.warn(f'Not a valid export argument: {self}')
+                return
+
             self.output_dir = os.path.join(ckpt_dir, f'{ckpt_name}-{suffix}')
 
-            logger.info(f'Setting args.output_dir: {self.output_dir}')
-
         self.output_dir = to_abspath(self.output_dir)
-        # TODO: logic optimization
-        if suffix != 'dummy':
-            assert not os.path.exists(self.output_dir), f'args.output_dir: {self.output_dir} already exists.'
+        if not self.exist_ok and os.path.exists(self.output_dir):
+            raise FileExistsError(f'args.output_dir: `{self.output_dir}` already exists.')
+        logger.info(f'args.output_dir: `{self.output_dir}`')
 
     def __post_init__(self):
-        if self.ckpt_dir:
-            self.ckpt_dir = to_abspath(self.ckpt_dir, True)
-            self.load_args_from_ckpt(self.ckpt_dir)
-        self._init_weight_type(self.ckpt_dir)
-        MergeArguments.__post_init__(self)
+        if self.quant_batch_size == -1:
+            self.quant_batch_size = None
+        if self.quant_bits and self.quant_method is None:
+            raise ValueError('Please specify the quantization method using `--quant_method awq/gptq/bnb`.')
+        if self.quant_method and self.quant_bits is None:
+            raise ValueError('Please specify `--quant_bits`.')
+        if self.quant_method in {'gptq', 'awq'} and self.torch_dtype is None:
+            self.torch_dtype = torch.float16
+        if self.to_mcore or self.to_hf:
+            self.mcore_model = to_abspath(self.mcore_model, check_path_exist=True)
+            if not dist.is_initialized():
+                set_default_ddp_config()
+                init_process_group(backend=self.ddp_backend, timeout=self.ddp_timeout)
+
         BaseArguments.__post_init__(self)
         self._init_output_dir()
-        if self.quant_bits:
-            self._init_quant()
-
-    def _init_torch_dtype(self) -> None:
-        if self.quant_bits and self.torch_dtype is None:
-            self.torch_dtype = 'float16'
-            logger.info(f'Setting args.torch_dtype: {self.torch_dtype}')
-        super()._init_torch_dtype()
+        if self.quant_method in {'gptq', 'awq'} and len(self.dataset) == 0:
+            raise ValueError(f'self.dataset: {self.dataset}, Please input the quant dataset.')

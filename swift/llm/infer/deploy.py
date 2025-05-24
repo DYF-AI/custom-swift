@@ -15,9 +15,10 @@ from aiohttp import ClientConnectorError
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from swift.llm import DeployArguments
+from swift.llm import AdapterRequest, DeployArguments
+from swift.llm.infer.protocol import MultiModalRequestMixin
 from swift.plugin import InferStats
-from swift.utils import get_logger
+from swift.utils import JsonlWriter, get_logger
 from .infer import SwiftInfer
 from .infer_engine import InferClient
 from .protocol import ChatCompletionRequest, CompletionRequest, Model, ModelList
@@ -36,6 +37,7 @@ class SwiftDeploy(SwiftInfer):
 
     def __init__(self, args: Union[List[str], DeployArguments, None] = None) -> None:
         super().__init__(args)
+
         self.infer_engine.strict = True
         self.infer_stats = InferStats()
         self.app = FastAPI(lifespan=self.lifespan)
@@ -56,7 +58,7 @@ class SwiftDeploy(SwiftInfer):
     def lifespan(self, app: FastAPI):
         args = self.args
         if args.log_interval > 0:
-            thread = Thread(target=lambda: asyncio.run(self._log_stats_hook()))
+            thread = Thread(target=lambda: asyncio.run(self._log_stats_hook()), daemon=True)
             thread.start()
         try:
             yield
@@ -67,8 +69,8 @@ class SwiftDeploy(SwiftInfer):
     def _get_model_list(self):
         args = self.args
         model_list = [args.served_model_name or args.model_suffix]
-        if args.lora_request_list is not None:
-            model_list += [lora_request.lora_name for lora_request in args.lora_request_list]
+        if args.adapter_mapping:
+            model_list += [name for name in args.adapter_mapping.keys()]
         return model_list
 
     async def get_available_models(self):
@@ -96,7 +98,7 @@ class SwiftDeploy(SwiftInfer):
 
     def _check_max_logprobs(self, request):
         args = self.args
-        if isinstance(request.top_logprobs, int) and request.top_logprobs > self.args.max_logprobs:
+        if isinstance(request.top_logprobs, int) and request.top_logprobs > args.max_logprobs:
             return (f'The value of top_logprobs({request.top_logprobs}) is greater than '
                     f'the server\'s max_logprobs({args.max_logprobs}).')
 
@@ -108,40 +110,69 @@ class SwiftDeploy(SwiftInfer):
     def _post_process(self, request_info, response, return_cmpl_response: bool = False):
         args = self.args
 
+        for i in range(len(response.choices)):
+            if not hasattr(response.choices[i], 'message') or not isinstance(response.choices[i].message.content,
+                                                                             (tuple, list)):
+                continue
+            for j, content in enumerate(response.choices[i].message.content):
+                if content['type'] == 'image':
+                    b64_image = MultiModalRequestMixin.to_base64(content['image'])
+                    response.choices[i].message.content[j]['image'] = f'data:image/jpg;base64,{b64_image}'
+
         is_finished = all(response.choices[i].finish_reason for i in range(len(response.choices)))
+        if 'stream' in response.__class__.__name__.lower():
+            request_info['response'] += response.choices[0].delta.content
+        else:
+            request_info['response'] = response.choices[0].message.content
         if return_cmpl_response:
             response = response.to_cmpl_response()
         if is_finished:
             if args.log_interval > 0:
                 self.infer_stats.update(response)
             if self.jsonl_writer:
-                data = {'response': asdict(response), **request_info}
-                self.jsonl_writer.append(data)
+                self.jsonl_writer.append(request_info)
+            if self.args.verbose:
+                logger.info(request_info)
         return response
+
+    def _set_request_config(self, request_config) -> None:
+        default_request_config = self.args.get_request_config()
+        if default_request_config is None:
+            return
+        for key, val in asdict(request_config).items():
+            default_val = getattr(default_request_config, key)
+            if default_val is not None and (val is None or isinstance(val, (list, tuple)) and len(val) == 0):
+                setattr(request_config, key, default_val)
 
     async def create_chat_completion(self,
                                      request: ChatCompletionRequest,
                                      raw_request: Request,
                                      *,
                                      return_cmpl_response: bool = False):
+        args = self.args
         error_msg = (await self._check_model(request) or self._check_api_key(raw_request)
                      or self._check_max_logprobs(request))
         if error_msg:
             return self.create_error_response(HTTPStatus.BAD_REQUEST, error_msg)
+        infer_kwargs = self.infer_kwargs.copy()
+        adapter_path = args.adapter_mapping.get(request.model)
+        if adapter_path:
+            infer_kwargs['adapter_request'] = AdapterRequest(request.model, adapter_path)
 
         infer_request, request_config = request.parse()
-        request_info = {'infer_request': infer_request.to_printable()}
+        self._set_request_config(request_config)
+        request_info = {'response': '', 'infer_request': infer_request.to_printable()}
 
         def pre_infer_hook(kwargs):
             request_info['generation_config'] = kwargs['generation_config']
-            if self.args.verbose:
-                logger.info(request_info)
             return kwargs
 
-        self.infer_engine.pre_infer_hooks = [pre_infer_hook]
+        infer_kwargs['pre_infer_hook'] = pre_infer_hook
         try:
-            res_or_gen = await self.infer_async(infer_request, request_config, template=self.template)
-        except ValueError as e:
+            res_or_gen = await self.infer_async(infer_request, request_config, template=self.template, **infer_kwargs)
+        except Exception as e:
+            import traceback
+            logger.info(traceback.format_exc())
             return self.create_error_response(HTTPStatus.BAD_REQUEST, str(e))
         if request_config.stream:
 
@@ -161,9 +192,15 @@ class SwiftDeploy(SwiftInfer):
 
     def run(self):
         args = self.args
+        self.jsonl_writer = JsonlWriter(args.result_path) if args.result_path else None
         logger.info(f'model_list: {self._get_model_list()}')
         uvicorn.run(
-            self.app, host=args.host, port=args.port, ssl_keyfile=args.ssl_keyfile, ssl_certfile=args.ssl_certfile)
+            self.app,
+            host=args.host,
+            port=args.port,
+            ssl_keyfile=args.ssl_keyfile,
+            ssl_certfile=args.ssl_certfile,
+            log_level=args.log_level)
 
 
 def deploy_main(args: Union[List[str], DeployArguments, None] = None) -> None:
@@ -185,7 +222,7 @@ def run_deploy(args: DeployArguments, return_url: bool = False):
         deploy_args = args
     else:
         args_dict = asdict(args)
-        parameters = inspect.signature(DeployArguments.__init__).parameters
+        parameters = inspect.signature(DeployArguments).parameters
         for k in list(args_dict.keys()):
             if k not in parameters or args_dict[k] is None:
                 args_dict.pop(k)
@@ -197,7 +234,7 @@ def run_deploy(args: DeployArguments, return_url: bool = False):
     try:
         while not is_accessible(deploy_args.port):
             time.sleep(1)
-        yield f'http://127.0.0.1:{deploy_args.port}/v1/chat/completions' if return_url else deploy_args.port
+        yield f'http://127.0.0.1:{deploy_args.port}/v1' if return_url else deploy_args.port
     finally:
         process.terminate()
         logger.info('The deployment process has been terminated.')

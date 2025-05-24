@@ -12,14 +12,14 @@ def _prepare(infer_backend: Literal['vllm', 'pt', 'lmdeploy']):
 
     if infer_backend == 'lmdeploy':
         from swift.llm import LmdeployEngine
-        engine = LmdeployEngine('qwen/Qwen2-7B-Instruct', torch.float32)
+        engine = LmdeployEngine('Qwen/Qwen2-7B-Instruct', torch.float32)
     elif infer_backend == 'pt':
         from swift.llm import PtEngine
-        engine = PtEngine('qwen/Qwen2-7B-Instruct')
+        engine = PtEngine('Qwen/Qwen2-7B-Instruct')
     elif infer_backend == 'vllm':
         from swift.llm import VllmEngine
-        engine = VllmEngine('qwen/Qwen2-7B-Instruct')
-    template = get_template(engine.template, engine.tokenizer)
+        engine = VllmEngine('Qwen/Qwen2-7B-Instruct')
+    template = get_template(engine.model_meta.template, engine.tokenizer)
     infer_requests = [
         InferRequest([{
             'role': 'user',
@@ -34,7 +34,8 @@ def _prepare(infer_backend: Literal['vllm', 'pt', 'lmdeploy']):
 
 
 def test_infer(engine, template, infer_requests):
-    from swift.llm import InferStats, RequestConfig
+    from swift.llm import RequestConfig
+    from swift.plugin import InferStats
 
     request_config = RequestConfig(temperature=0, logprobs=True, top_logprobs=2)
     infer_stats = InferStats()
@@ -48,15 +49,15 @@ def test_infer(engine, template, infer_requests):
 
 
 def test_stream(engine, template, infer_requests):
-    from swift.llm import InferStats, RequestConfig
+    from swift.llm import RequestConfig
+    from swift.plugin import InferStats
 
     infer_stats = InferStats()
     request_config = RequestConfig(temperature=0, stream=True, logprobs=True, top_logprobs=2)
 
-    gen = engine.infer(infer_requests, template=template, request_config=request_config, metrics=[infer_stats])
+    gen_list = engine.infer(infer_requests, template=template, request_config=request_config, metrics=[infer_stats])
 
-    for response_list in gen:
-        response = response_list[0]
+    for response in gen_list[0]:
         if response is None:
             continue
         print(response.choices[0].delta.content, end='', flush=True)

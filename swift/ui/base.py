@@ -1,24 +1,32 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import dataclasses
 import os
 import sys
 import time
 import typing
+from collections import OrderedDict
 from dataclasses import fields
 from datetime import datetime
 from functools import wraps
-from typing import Any, Dict, List, OrderedDict, Type
+from typing import Any, Dict, List, Type
 
 import gradio as gr
 import json
 from gradio import Accordion, Audio, Button, Checkbox, Dropdown, File, Image, Slider, Tab, TabItem, Textbox, Video
 from modelscope.hub.utils.utils import get_cache_dir
 
-from swift.llm import TEMPLATE_MAPPING, BaseArguments
-from swift.llm.model.register import get_matched_model_meta
+from swift.llm import TEMPLATE_MAPPING, BaseArguments, get_matched_model_meta
 
 all_langs = ['zh', 'en']
 builder: Type['BaseUI'] = None
 base_builder: Type['BaseUI'] = None
+
+DEFAULT_GRPO_SYSTEM = (
+    'A conversation between User and Assistant. The user asks a question, and the Assistant solves it. '
+    'The assistant first thinks about the reasoning process in the mind and then provides the user '
+    'with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> '
+    '</answer> tags, respectively, i.e., <think> reasoning process here </think>'
+    '<answer> answer here </answer>')
 
 
 def update_data(fn):
@@ -31,6 +39,7 @@ def update_data(fn):
         if builder is not None:
             choices = base_builder.choice(elem_id)
             if choices:
+                choices = [str(choice) if choice is not None else None for choice in choices]
                 kwargs['choices'] = choices
 
         if not isinstance(self, (Tab, TabItem, Accordion)) and 'interactive' not in kwargs:  # noqa
@@ -102,7 +111,7 @@ class BaseUI:
         'local_dir_alert': {
             'value': {
                 'zh': '无法识别model_type和template,请手动选择',
-                'en': 'Cannot recognize the model_type and template, please choose manully'
+                'en': 'Cannot recognize the model_type and template, please choose manually'
             }
         },
     }
@@ -137,7 +146,7 @@ class BaseUI:
         timestamp = str(int(time.time()))
         key = key.replace('/', '-')
         filename = os.path.join(cls.cache_dir, key + '-' + timestamp)
-        with open(filename, 'w') as f:
+        with open(filename, 'w', encoding='utf-8') as f:
             json.dump(value, f)
 
     @classmethod
@@ -160,7 +169,7 @@ class BaseUI:
         timestamp = int(dt_object.timestamp())
         key = key.replace('/', '-')
         filename = key + '-' + str(timestamp)
-        with open(os.path.join(cls.cache_dir, filename), 'r') as f:
+        with open(os.path.join(cls.cache_dir, filename), 'r', encoding='utf-8') as f:
             return json.load(f)
 
     @classmethod
@@ -219,12 +228,12 @@ class BaseUI:
 
     @classmethod
     def valid_elements(cls):
+        valid_elements = OrderedDict()
         elements = cls.elements()
-        return {
-            key: value
-            for key, value in elements.items()
-            if isinstance(value, (Textbox, Dropdown, Slider, Checkbox)) and key != 'train_record'
-        }
+        for key, value in elements.items():
+            if isinstance(value, (Textbox, Dropdown, Slider, Checkbox)) and key != 'train_record':
+                valid_elements[key] = value
+        return valid_elements
 
     @classmethod
     def element_keys(cls):
@@ -258,19 +267,31 @@ class BaseUI:
     def get_choices_from_dataclass(dataclass):
         choice_dict = {}
         for f in fields(dataclass):
+            default_value = f.default
+            if 'MISSING_TYPE' in str(default_value):
+                default_value = None
             if 'choices' in f.metadata:
-                choice_dict[f.name] = f.metadata['choices']
+                choice_dict[f.name] = list(f.metadata['choices'])
             if 'Literal' in str(f.type) and typing.get_args(f.type):
-                choice_dict[f.name] = typing.get_args(f.type)
+                choice_dict[f.name] = list(typing.get_args(f.type))
+            if f.name in choice_dict and default_value not in choice_dict[f.name]:
+                choice_dict[f.name].insert(0, default_value)
         return choice_dict
 
     @staticmethod
     def get_default_value_from_dataclass(dataclass):
         default_dict = {}
         for f in fields(dataclass):
-            if hasattr(dataclass, f.name):
-                default_dict[f.name] = getattr(dataclass, f.name)
+            if f.default.__class__ is dataclasses._MISSING_TYPE:
+                default_dict[f.name] = f.default_factory()
             else:
+                default_dict[f.name] = f.default
+            if isinstance(default_dict[f.name], list):
+                try:
+                    default_dict[f.name] = ' '.join(default_dict[f.name])
+                except TypeError:
+                    default_dict[f.name] = None
+            if not default_dict[f.name]:
                 default_dict[f.name] = None
         return default_dict
 
@@ -282,8 +303,16 @@ class BaseUI:
         return arguments
 
     @classmethod
-    def update_input_model(cls, model, allow_keys=None, has_record=True, arg_cls=BaseArguments):
+    def update_input_model(cls,
+                           model,
+                           allow_keys=None,
+                           has_record=True,
+                           arg_cls=BaseArguments,
+                           is_ref_model=False,
+                           is_reward_model=False):
         keys = cls.valid_element_keys()
+        if allow_keys:
+            keys = [key for key in keys if key in allow_keys]
 
         if not model:
             ret = [gr.update()] * (len(keys) + int(has_record))
@@ -305,15 +334,19 @@ class BaseUI:
         if os.path.exists(local_args_path):
             try:
                 if hasattr(arg_cls, 'resume_from_checkpoint'):
-                    args = arg_cls(resume_from_checkpoint=model, load_dataset_config=True)
+                    try:
+                        args = arg_cls(resume_from_checkpoint=model, load_data_args=True)
+                    except Exception as e:
+                        if 'using `--model`' in str(e):  # TODO a dirty fix
+                            args = arg_cls(model=model, load_data_args=True)
+                        else:
+                            raise e
                 else:
-                    args = arg_cls(ckpt_dir=model, load_dataset_config=True)
+                    args = arg_cls(ckpt_dir=model, load_data_args=True)
             except ValueError:
                 return [gr.update()] * (len(keys) + int(has_record))
             values = []
             for key in keys:
-                if allow_keys is not None and key not in allow_keys:
-                    continue
                 arg_value = getattr(args, key, None)
                 if arg_value and key != 'model':
                     if key in ('torch_dtype', 'bnb_4bit_compute_dtype'):
@@ -334,16 +367,26 @@ class BaseUI:
         else:
             values = []
             for key in keys:
-                if allow_keys is not None and key not in allow_keys:
-                    continue
-                if key not in ('template', 'model_type', 'ref_model_type', 'system'):
+                if key not in ('template', 'model_type', 'ref_model_type', 'reward_model_type', 'system'):
                     values.append(gr.update())
-                elif key in ('template', 'model_type', 'ref_model_type'):
+                elif key in ('template', 'model_type', 'ref_model_type', 'reward_model_type'):
                     if key == 'ref_model_type':
-                        key = 'model_type'
-                    values.append(gr.update(value=getattr(model_meta, key)))
+                        if is_ref_model:
+                            values.append(gr.update(value=getattr(model_meta, 'model_type')))
+                        else:
+                            values.append(gr.update())
+                    elif key == 'reward_model_type':
+                        if is_reward_model:
+                            values.append(gr.update(value=getattr(model_meta, 'model_type')))
+                        else:
+                            values.append(gr.update())
+                    else:
+                        values.append(gr.update(value=getattr(model_meta, key)))
                 else:
-                    values.append(gr.update(value=TEMPLATE_MAPPING[model_meta.template].default_system))
+                    if cls.group == 'llm_grpo':
+                        values.append(gr.update(value=DEFAULT_GRPO_SYSTEM))
+                    else:
+                        values.append(gr.update(value=TEMPLATE_MAPPING[model_meta.template].default_system))
 
         if has_record:
             return [gr.update(choices=cls.list_cache(model))] + values
@@ -358,7 +401,7 @@ class BaseUI:
             return [gr.update()] * len(cls.elements())
         cache = cls.load_cache(model, train_record)
         updates = []
-        for key, value in cls.valid_elements().items():
+        for key, value in base_tab.valid_elements().items():
             if key in cache:
                 updates.append(gr.update(value=cache[key]))
             else:

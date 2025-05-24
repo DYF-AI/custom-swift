@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
 import json
+import torch
 from torch import nn
 
 from ..base import Template
@@ -10,10 +11,12 @@ from ..constant import LLMTemplateType, MLLMTemplateType
 from ..register import TemplateMeta, register_template
 from ..template_inputs import StdTemplateInputs
 from ..utils import Context, Prompt, findall
+from ..vision_utils import load_file
 
 
 class FlorenceTemplate(Template):
-    # loss_scale = 'last_round'
+    # If it's an encoder-decoder architecture, the default settings are
+    # loss_scale: 'last_round' and skip_prompt: False.
     is_encoder_decoder = True
 
     @staticmethod
@@ -24,17 +27,8 @@ class FlorenceTemplate(Template):
                     inputs: StdTemplateInputs) -> List[Context]:
         return []
 
-    def replace_box(self, object_: Dict[str, Any], index: int, inputs: StdTemplateInputs) -> List[Context]:
-        object_ = inputs.objects[index]
-        if isinstance(object_['bbox'][0], list):
-            all_objects = ''
-            for sub_object in object_['bbox']:
-                x1, y1, x2, y2 = sub_object
-                all_objects += f'<loc_{x1}><loc_{y1}><loc_{x2}><loc_{y2}>,'
-            return [all_objects[:-1]]
-        else:
-            x1, y1, x2, y2 = object_['bbox']
-            return [f'<loc_{x1}><loc_{y1}><loc_{x2}><loc_{y2}>']
+    def replace_bbox(self, bbox: List[int], index: int, inputs: StdTemplateInputs) -> List[Context]:
+        return [''.join(f'<loc_{box}>' for box in bbox)]
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         processor = self.processor
@@ -46,34 +40,36 @@ class FlorenceTemplate(Template):
                 break
         encoded = super()._encode(inputs)
         input_ids = encoded['prompt_input_ids']
-        if len(encoded) == 0:
-            return encoded
         images = inputs.images or []
         labels = encoded['labels']
         if labels is not None:
             labels = [0] + labels
-        pixel_values = processor.image_processor(
-            images, return_tensors='pt')['pixel_values'].to(self.config.torch_dtype)
-        encoded = {
-            'input_ids': input_ids,
-            'labels': labels,
-            'pixel_values': pixel_values,
-        }
+        if images:
+            pixel_values = processor.image_processor(
+                images, return_tensors='pt')['pixel_values'].to(self.model_info.torch_dtype)
+            encoded['pixel_values'] = pixel_values
+        encoded['input_ids'] = input_ids
+        encoded['labels'] = labels
         return encoded
 
     def _post_encode(self, model: nn.Module, inputs: Dict[str, Any]) -> Dict[str, Any]:
         inputs_embeds = model.get_input_embeddings()(inputs['input_ids'])
-        image_features = model._encode_image(inputs['pixel_values'])
-        inputs_embeds, _ = model._merge_input_ids_with_image_features(image_features, inputs_embeds)
+        pixel_values = inputs.get('pixel_values')
+        if pixel_values is not None:
+            image_features = model._encode_image(pixel_values)
+            inputs_embeds, inputs['attention_mask'] = model._merge_input_ids_with_image_features(
+                image_features, inputs_embeds)
         return {'inputs_embeds': inputs_embeds}
 
     def decode(self, generate_ids: List[int], **kwargs) -> Any:
         response = super().decode(generate_ids, **kwargs)
         template_inputs = kwargs.get('template_inputs')
         images = template_inputs.images
+        image_size = None
+        if images:
+            image_size = (images[0].width, images[0].height)
         return json.dumps(
-            self.processor.post_process_generation(
-                response, task=template_inputs.query, image_size=(images[0].width, images[0].height)))
+            self.processor.post_process_generation(response, task=template_inputs.query, image_size=image_size))
 
 
 register_template(
@@ -84,7 +80,7 @@ register_template(
         chat_sep=None,
         suffix=['</s>'],
         template_cls=FlorenceTemplate,
-        support_stream=False))
+    ))
 
 
 @dataclass
@@ -100,6 +96,21 @@ class Phi3TemplateMeta(TemplateMeta):
 register_template(Phi3TemplateMeta(LLMTemplateType.phi3))
 
 
+@dataclass
+class Phi4TemplateMeta(TemplateMeta):
+    prefix: Prompt = field(default_factory=list)
+    prompt: Prompt = field(
+        default_factory=lambda: ['<|im_start|>user<|im_sep|>{{QUERY}}<|im_end|><|im_start|>assistant<|im_sep|>'])
+    chat_sep: Optional[Prompt] = field(default_factory=lambda: ['<|im_end|>'])
+    suffix: Prompt = field(default_factory=lambda: ['<|im_end|>'])
+    system_prefix: Optional[Prompt] = field(
+        default_factory=lambda: ['<|im_start|>system<|im_sep|>{{SYSTEM}}<|im_end|>'])
+    auto_add_bos: bool = True
+
+
+register_template(Phi4TemplateMeta(LLMTemplateType.phi4))
+
+
 class Phi3VisionTemplate(Template):
     image_placeholder = ['<|image|><s>\n']  # <|image|>\n
 
@@ -113,8 +124,6 @@ class Phi3VisionTemplate(Template):
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         images = inputs.images or []
         encoded = super()._encode(inputs)
-        if len(encoded) == 0:
-            return encoded
         input_ids = encoded['input_ids']
         labels = encoded['labels']
         idx_list = findall(input_ids, 32044)  # '<|image|>'
@@ -143,4 +152,54 @@ class Phi3VisionTemplate(Template):
         return encoded
 
 
+class Phi4MMTemplate(Template):
+    placeholder_tokens = ['<|endoftext10|>', '<|endoftext11|>']
+
+    def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
+                    inputs: StdTemplateInputs) -> List[Context]:
+        if media_type == 'image':
+            return [[-100]]
+        elif media_type == 'audio':
+            import soundfile as sf
+            inputs.audios[index] = sf.read(load_file(inputs.audios[index]))
+            return [[-200]]
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        encoded = super()._encode(inputs)
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
+        images_idx = findall(input_ids, -100)
+        audios_idx = findall(input_ids, -200)
+        text = '\n'.join(['<|image_1|>'] * len(inputs.images) + ['<|audio_1|>'] * len(inputs.audios))
+        new_encoded = self.processor(
+            text=text, images=inputs.images or None, audios=inputs.audios or None, return_tensors='pt')
+        placeholders = self._split_list(new_encoded.pop('input_ids')[0].tolist(), 198)
+
+        def _get_new_tokens(i):
+            return placeholders[i]
+
+        encoded['input_ids'], encoded['labels'] = self._extend_tokens(input_ids, labels, images_idx + audios_idx,
+                                                                      _get_new_tokens)
+        new_encoded.pop('attention_mask')
+        encoded.update(new_encoded)
+        return encoded
+
+    def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+        res = super()._data_collator(batch, padding_to=padding_to)
+        keys = [
+            'input_image_embeds', 'image_sizes', 'image_attention_mask', 'input_audio_embeds', 'audio_embed_sizes',
+            'input_mode'
+        ]
+        inputs = self.fetch_inputs(batch, keys)
+        for k, v in inputs.items():
+            inputs[k] = torch.concat(v)
+        res.update(inputs)
+        return res
+
+
 register_template(Phi3TemplateMeta(MLLMTemplateType.phi3_vision, template_cls=Phi3VisionTemplate))
+
+register_template(Phi3TemplateMeta(
+    MLLMTemplateType.phi4_multimodal,
+    template_cls=Phi4MMTemplate,
+))

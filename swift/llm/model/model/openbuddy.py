@@ -35,11 +35,16 @@ register_model(
             ModelGroup([
                 Model('OpenBuddy/openbuddy-llama3-8b-v21.1-8k', 'OpenBuddy/openbuddy-llama3-8b-v21.1-8k'),
                 Model('OpenBuddy/openbuddy-llama3-70b-v21.1-8k', 'OpenBuddy/openbuddy-llama3-70b-v21.1-8k'),
+                Model('OpenBuddy/openbuddy-yi1.5-34b-v21.3-32k', 'OpenBuddy/openbuddy-yi1.5-34b-v21.3-32k'),
             ]),
             ModelGroup([
                 Model('OpenBuddy/openbuddy-llama3.1-8b-v22.1-131k', 'OpenBuddy/openbuddy-llama3.1-8b-v22.1-131k'),
+                Model('OpenBuddy/openbuddy-nemotron-70b-v23.2-131k', 'OpenBuddy/openbuddy-nemotron-70b-v23.2-131k'),
             ],
                        requires=['transformers>=4.43']),
+            ModelGroup(
+                [Model('OpenBuddy/openbuddy-llama3.3-70b-v24.3-131k', 'OpenBuddy/openbuddy-llama3.3-70b-v24.3-131k')],
+                requires=['transformers>=4.45'])
         ],
         TemplateType.openbuddy2,
         get_model_tokenizer_with_flash_attn,
@@ -75,7 +80,6 @@ register_model(
         ],
         TemplateType.openbuddy,
         get_model_tokenizer_with_flash_attn,
-        model_arch=ModelArch.llama,
         architectures=['MixtralForCausalLM'],
         requires=['transformers>=4.36'],
     ))

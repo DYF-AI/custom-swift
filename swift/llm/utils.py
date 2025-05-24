@@ -2,15 +2,17 @@
 import inspect
 import os
 import shutil
+import tempfile
 from types import MethodType
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from modelscope.hub.utils.utils import get_cache_dir
 from transformers import FeatureExtractionMixin, GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase
 from transformers import ProcessorMixin as HfProcessorMixin
 
-from swift.utils import deep_getattr, get_logger, upper_bound
+from swift.utils import deep_getattr, get_logger
 
 try:
     from transformers import BaseImageProcessor
@@ -18,9 +20,15 @@ try:
 except ImportError:
     Processor = Union[PreTrainedTokenizerBase, FeatureExtractionMixin, HfProcessorMixin]
 
+if 'TOKENIZERS_PARALLELISM' not in os.environ:
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 logger = get_logger()
 
+Tool = Dict[str, Union[str, Dict]]
 History = List[Union[Tuple[str, str], List[str]]]
+Message = Dict[str, Union[str, List[Dict[str, Any]]]]
+Messages = List[Message]
 
 
 class ProcessorMixin:
@@ -40,7 +48,19 @@ class ProcessorMixin:
             raise AttributeError('Please use `self.processor` for assignment.')
 
 
-def to_device(data: Any, device: torch.device) -> Any:
+def to_float_dtype(data: Any, dtype: torch.dtype) -> Any:
+    """Change the float inputs to a dtype"""
+    if isinstance(data, Mapping):
+        return type(data)({k: to_float_dtype(v, dtype) for k, v in data.items()})
+    elif isinstance(data, (tuple, list)):
+        return type(data)(to_float_dtype(v, dtype) for v in data)
+    elif isinstance(data, torch.Tensor) and torch.is_floating_point(data):
+        return data.to(dtype=dtype)
+    else:
+        return data
+
+
+def to_device(data: Any, device: Union[str, torch.device, int]) -> Any:
     """Move inputs to a device"""
     if isinstance(data, Mapping):
         return type(data)({k: to_device(v, device) for k, v in data.items()})
@@ -56,7 +76,7 @@ def set_generation_config(model: nn.Module, generation_config: GenerationConfig)
     old_generation_config = getattr(model, 'generation_config', None)
     old_generation_priority_config = ['no_repeat_ngram_size', 'num_beams']
     if old_generation_config is not None:
-        for k, old_v in old_generation_config.__dict__.items():
+        for k, old_v in dir(old_generation_config).items():
             if k.startswith('_'):
                 continue
             v = getattr(generation_config, k, None)
@@ -65,12 +85,22 @@ def set_generation_config(model: nn.Module, generation_config: GenerationConfig)
     model.generation_config = generation_config
 
 
+def is_moe_model(model):
+    if 'Moe' in model.__class__.__name__:
+        return True
+    for key in ['num_experts', 'num_experts_per_tok', 'moe_intermediate_size']:
+        if hasattr(model.config, key):
+            return True
+    return False
+
+
 def find_module_list(model) -> Optional[nn.ModuleList]:
     module_lists = []
     for m in model.modules():
-        if hasattr(m, 'gradient_checkpointing'):
+        if hasattr(m, 'gradient_checkpointing') or m.__class__.__name__ == 'CheckpointWrapper':
             return
-        if isinstance(m, nn.ModuleList) and len(m) >= 10:
+        if (isinstance(m, (nn.ModuleList, nn.Sequential)) and len(m) >= 10
+                and 'mlp' not in m[0].__class__.__name__.lower()):  # fix moe
             module_lists.append(m)
     if module_lists:
         return max(module_lists, key=lambda x: len(x))
@@ -120,20 +150,24 @@ def _add_gradient_checkpointing(module_list):
         module.__old_forward = __old_forward
 
 
-def dynamic_gradient_checkpointing(model) -> None:
+def dynamic_gradient_checkpointing(model, including_vit: bool = False) -> None:
     from .model import ModelMeta, get_model_arch
     model_meta: ModelMeta = model.model_meta
     model_arch = get_model_arch(model_meta.model_arch)
-    if model_meta.is_multimodal:
-        tower_names = model_arch.language_model + model_arch.vision_tower
+    if model_meta.is_multimodal and model_arch:
+        tower_names = model_arch.language_model.copy()
+        if including_vit:
+            tower_names += model_arch.vision_tower
     else:
         tower_names = [None]
 
+    model.supports_gradient_checkpointing = True
     for tower_name in tower_names:
         if tower_name is None:
             model_tower = model
         else:
             model_tower = deep_getattr(model, tower_name)
+        model_tower.supports_gradient_checkpointing = True
         module_list = find_module_list(model_tower)
         if module_list is None:
             continue
@@ -198,16 +232,27 @@ def save_checkpoint(model: Optional[PreTrainedModel],
                     *,
                     safe_serialization: bool = True,
                     max_shard_size: Union[int, str] = '5GB',
-                    ckpt_dir: str = None,
+                    model_dirs: List[str] = None,
                     additional_saved_files: Optional[List[str]] = None) -> None:
     if model is not None:
-        model.save_pretrained(output_dir, safe_serialization=safe_serialization, max_shard_size=max_shard_size)
+        if model.__class__.__name__ != 'SentenceTransformer':
+            model.save_pretrained(output_dir, safe_serialization=safe_serialization, max_shard_size=max_shard_size)
+        else:
+            model.save_pretrained(output_dir, safe_serialization=safe_serialization)
+            # copy sentencetransformers files
+            from swift.utils import copy_files_by_pattern
+            copy_files_by_pattern(model.model_dir, output_dir, '*.py')
+            copy_files_by_pattern(model.model_dir, output_dir, '*.json')
     processor.save_pretrained(output_dir)
 
-    for src_file in additional_saved_files or [] + ['preprocessor_config.json', 'args.json']:
-        for model_dir in [model and model.model_dir, ckpt_dir]:
-            if model_dir is None:
-                continue
+    if model_dirs is None:
+        model_dirs = []
+    else:
+        model_dirs = model_dirs.copy()
+    if model and model.model_dir and model.model_dir not in model_dirs:
+        model_dirs.append(model.model_dir)
+    for src_file in (additional_saved_files or []) + ['preprocessor_config.json', 'args.json']:
+        for model_dir in model_dirs:
             src_path: str = os.path.join(model_dir, src_file)
             tgt_path = os.path.join(output_dir, src_file)
             if os.path.isfile(src_path):
@@ -216,3 +261,40 @@ def save_checkpoint(model: Optional[PreTrainedModel],
             elif os.path.isdir(src_path):
                 shutil.copytree(src_path, tgt_path)
                 break
+
+
+TEMP_DIR_POOL = {}
+
+
+def get_temporary_cache_files_directory(prefix=None):
+    if prefix is None:
+        import datasets.config
+        prefix = datasets.config.TEMP_CACHE_DIR_PREFIX
+    global TEMP_DIR_POOL
+    if prefix in TEMP_DIR_POOL:
+        TEMP_DIR = TEMP_DIR_POOL[prefix]
+    else:
+        tmp_dir = os.path.join(get_cache_dir(), 'tmp')
+        os.makedirs(tmp_dir, exist_ok=True)
+        kwargs = {}
+        parameters = inspect.signature(tempfile.TemporaryDirectory.__init__).parameters
+        if 'ignore_cleanup_errors' in parameters:
+            kwargs['ignore_cleanup_errors'] = True
+        TEMP_DIR = tempfile.TemporaryDirectory(prefix=prefix, dir=tmp_dir, **kwargs)
+        logger.info(f'create tmp_dir: {TEMP_DIR.name}')
+        TEMP_DIR_POOL[prefix] = TEMP_DIR
+
+    return TEMP_DIR.name
+
+
+def get_ckpt_dir(model_dir: str, adapters_dir: Optional[List[str]]) -> str:
+    model_dirs = (adapters_dir or []).copy()
+    if model_dir:
+        model_dirs.append(model_dir)
+    # The adapter takes higher priority.
+    ckpt_dir = None
+    for model_dir in model_dirs:
+        if os.path.exists(os.path.join(model_dir, 'args.json')):
+            ckpt_dir = model_dir
+            break
+    return ckpt_dir

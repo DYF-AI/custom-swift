@@ -10,13 +10,13 @@ def _prepare(infer_backend: Literal['vllm', 'pt', 'lmdeploy']):
     from swift.llm import InferRequest, get_template
     if infer_backend == 'lmdeploy':
         from swift.llm import LmdeployEngine
-        engine = LmdeployEngine('qwen/Qwen2-7B-Instruct', torch.float32)
+        engine = LmdeployEngine('OpenGVLab/InternVL2_5-2B', torch.float32)
     elif infer_backend == 'pt':
         from swift.llm import PtEngine
-        engine = PtEngine('qwen/Qwen2-7B-Instruct', max_batch_size=16)
+        engine = PtEngine('Qwen/Qwen2-7B-Instruct', max_batch_size=16)
     elif infer_backend == 'vllm':
         from swift.llm import VllmEngine
-        engine = VllmEngine('qwen/Qwen2-7B-Instruct')
+        engine = VllmEngine('Qwen/Qwen2-7B-Instruct')
     template = get_template(engine.model_meta.template, engine.tokenizer)
     infer_requests = [
         # InferRequest([{'role': 'user', 'content': '晚上睡不着觉怎么办'}]) for i in range(100)
@@ -50,20 +50,19 @@ def test_stream(infer_backend):
     infer_stats = InferStats()
     request_config = RequestConfig(temperature=0, stream=True, logprobs=True)
 
-    gen = engine.infer(infer_requests, template=template, request_config=request_config, metrics=[infer_stats])
+    gen_list = engine.infer(infer_requests, template=template, request_config=request_config, metrics=[infer_stats])
 
-    for response_list in gen:
-        response = response_list[0]
+    for response in gen_list[0]:
         if response is None:
             continue
         print(response.choices[0].delta.content, end='', flush=True)
     print()
     print(infer_stats.compute())
 
-    gen = engine.infer(
+    gen_list = engine.infer(
         infer_requests, template=template, request_config=request_config, use_tqdm=True, metrics=[infer_stats])
 
-    for response_list in gen:
+    for response in gen_list[0]:
         pass
 
     print(infer_stats.compute())

@@ -59,28 +59,25 @@ class TextGenerationPreprocessor(ResponsePreprocessor):
                  *,
                  prompt: str,
                  query_tag: str = '{{QUERY}}',
-                 columns_mapping: Optional[Dict[str, str]] = None,
+                 columns: Optional[Dict[str, str]] = None,
                  **kwargs) -> None:
         self.query_tag = query_tag
         self.prompt = prompt
-        super().__init__(columns_mapping=columns_mapping, **kwargs)
+        super().__init__(columns=columns, **kwargs)
 
     def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        row = super().preprocess(row)
-        messages = row['messages']
-        query_message = messages[-2]
-        query_message['content'] = self.prompt.replace(self.query_tag, query_message['content'])
-        return row
+        row['query'] = self.prompt.replace(self.query_tag, row['query'])
+        return super().preprocess(row)
 
 
-class ClsPreprocessor(ResponsePreprocessor):
+class ClsGenerationPreprocessor(ResponsePreprocessor):
 
     def __init__(self,
                  labels: List[str],
                  *,
                  task: str,
                  is_pair_seq: bool = False,
-                 columns_mapping: Optional[Dict[str, str]] = None,
+                 columns: Optional[Dict[str, str]] = None,
                  **kwargs) -> None:
         self.labels = labels
         self.task = task
@@ -99,7 +96,7 @@ class ClsPreprocessor(ResponsePreprocessor):
 {inputs}
 Category: {category}
 Output:"""
-        super().__init__(columns_mapping=columns_mapping, **kwargs)
+        super().__init__(columns=columns, **kwargs)
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         label = row.pop(self.label_key, None)

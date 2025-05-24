@@ -2,6 +2,7 @@
 import importlib.util
 import logging
 import os
+from contextlib import contextmanager
 from types import MethodType
 from typing import Optional
 
@@ -25,16 +26,18 @@ warning_set = set()
 
 
 def info_once(self, msg, *args, **kwargs):
-    if msg in info_set:
+    hash_id = kwargs.get('hash_id') or msg
+    if hash_id in info_set:
         return
-    info_set.add(msg)
+    info_set.add(hash_id)
     self.info(msg)
 
 
 def warning_once(self, msg, *args, **kwargs):
-    if msg in warning_set:
+    hash_id = kwargs.get('hash_id') or msg
+    if hash_id in warning_set:
         return
-    warning_set.add(msg)
+    warning_set.add(hash_id)
     self.warning(msg)
 
 
@@ -105,6 +108,17 @@ if _is_local_master():
     ms_logger.setLevel(log_level)
 else:
     ms_logger.setLevel(logging.ERROR)
+
+
+@contextmanager
+def ms_logger_ignore_error():
+    ms_logger = get_ms_logger()
+    origin_log_level = ms_logger.level
+    ms_logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        ms_logger.setLevel(origin_log_level)
 
 
 def add_file_handler_if_needed(logger, log_file, file_mode, log_level):

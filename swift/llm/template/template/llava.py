@@ -11,18 +11,20 @@ from ..constant import MLLMTemplateType
 from ..register import TemplateMeta, register_template
 from ..template_inputs import StdTemplateInputs
 from ..utils import Context, Prompt, findall
-from ..vision_utils import load_batch, load_video_llava
+from ..vision_utils import load_video_llava
 from .llama import Llama3TemplateMeta
 from .qwen import QwenTemplateMeta
 from .utils import ChatmlTemplateMeta
 
 
 class LlavaHfTemplate(Template):
+    placeholder_tokens = ['<image>']
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        if version.parse(transformers.__version__) < version.parse('4.43.0'):
-            self.padding_side = 'left'
+    @property
+    def image_token_index(self):
+        if not hasattr(self, '_image_token_index'):
+            self._image_token_index = self.tokenizer.convert_tokens_to_ids(self.processor.image_token)
+        return self._image_token_index
 
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
@@ -31,15 +33,37 @@ class LlavaHfTemplate(Template):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
-        if len(encoded) == 0:
-            return encoded
         images = inputs.images
         if images:
             image_processor = self.processor.image_processor
-            image_inputs = image_processor(images, return_tensors='pt').to(self.config.torch_dtype)
+            image_inputs = image_processor(images, return_tensors='pt').to(self.model_info.torch_dtype)
             encoded['pixel_values'] = image_inputs['pixel_values']
             if 'image_sizes' in image_inputs:
                 encoded['image_sizes'] = image_inputs['image_sizes']
+            if version.parse(transformers.__version__) >= version.parse('4.47'):
+                input_ids = encoded['input_ids']
+                labels = encoded['labels']
+                idx_list = findall(input_ids, self.image_token_index)  # <image>
+                height, width = image_inputs['pixel_values'][0].shape[-2:]
+                added_tokens_len = 0
+                for i, idx in enumerate(idx_list):
+                    if 'image_sizes' in image_inputs:
+                        orig_height, orig_width = image_inputs['image_sizes'][i].tolist()
+                        num_image_tokens = self.processor._get_number_of_features(orig_height, orig_width, height,
+                                                                                  width)
+                    else:
+                        num_image_tokens = (height // self.processor.patch_size) * (
+                            width // self.processor.patch_size) + self.processor.num_additional_image_tokens
+                    if self.processor.vision_feature_select_strategy == 'default':
+                        num_image_tokens -= 1
+                    input_ids = input_ids[:added_tokens_len + idx] + [self.image_token_index] * num_image_tokens \
+                        + input_ids[added_tokens_len + idx + 1:]
+                    if labels is not None:
+                        labels = labels[:added_tokens_len + idx] + [-100] * num_image_tokens \
+                            + labels[added_tokens_len + idx + 1:]
+                    added_tokens_len += num_image_tokens - 1
+                encoded['input_ids'] = input_ids
+                encoded['labels'] = labels
         return encoded
 
 
@@ -50,6 +74,7 @@ register_template(
         prompt=['USER: {{QUERY}}\nASSISTANT:'],
         chat_sep=['</s>'],
         suffix=['</s>'],
+        system_prefix=['<s>{{SYSTEM}}\n'],
         template_cls=LlavaHfTemplate,
     ))
 
@@ -70,18 +95,15 @@ class LlavaVideoHfTemplate(Template):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
-        if len(encoded) == 0:
-            return encoded
         images = inputs.images or []
-        videos_path = inputs.videos or []
-        if len(videos_path) > 0:
-            videos = load_batch(videos_path, load_video_llava)
+        videos = inputs.videos or []
+        if len(videos) > 0:
             video_processor = self.processor.video_processor
-            video_inputs = video_processor(videos, return_tensors='pt').to(self.config.torch_dtype)
+            video_inputs = video_processor(videos, return_tensors='pt').to(self.model_info.torch_dtype)
             encoded['pixel_values_videos'] = video_inputs['pixel_values_videos']
         if len(images) > 0:
             image_processor = self.processor.image_processor
-            image_inputs = image_processor(images, return_tensors='pt').to(self.config.torch_dtype)
+            image_inputs = image_processor(images, return_tensors='pt').to(self.model_info.torch_dtype)
             encoded['pixel_values'] = image_inputs['pixel_values']
             encoded['image_sizes'] = image_inputs['image_sizes']
         return encoded
@@ -161,8 +183,6 @@ class LlavaOneVisionHfTemplate(Llava1_6HfTemplate):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = Template._encode(self, inputs)
-        if len(encoded) == 0:
-            return encoded
         images = inputs.images
         input_ids = encoded['input_ids']
         labels = encoded['labels']
@@ -170,10 +190,12 @@ class LlavaOneVisionHfTemplate(Llava1_6HfTemplate):
         processor = self.processor
         if images:
             image_processor = processor.image_processor
-            image_inputs = image_processor(images, return_tensors='pt').to(self.config.torch_dtype)
+            image_inputs = image_processor(images, return_tensors='pt').to(self.model_info.torch_dtype)
             height, width = image_inputs['pixel_values'][0].shape[-2:]
             added_tokens_len = 0
             for idx, pixel_v, image_size in zip(idx_list, image_inputs['pixel_values'], image_inputs['image_sizes']):
+                if isinstance(image_size, torch.Tensor):
+                    image_size = image_size.tolist()
                 orig_height, orig_width = image_size
                 num_image_tokens = processor._get_number_of_features(orig_height, orig_width, height, width)
                 input_ids = input_ids[:added_tokens_len
@@ -195,7 +217,6 @@ register_template(
         MLLMTemplateType.llava_onevision_hf,
         default_system=None,
         template_cls=LlavaOneVisionHfTemplate,
-        placeholder_tokens=['<image>'],
     ))
 
 
@@ -226,12 +247,10 @@ class LLavaLlama3HfTemplate(Template):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
-        if len(encoded) == 0:
-            return encoded
         raw_image = inputs.images
         if raw_image:
             pixel_values = self.processor.image_processor(raw_image, return_tensors='pt')['pixel_values']
-            encoded['pixel_values'] = pixel_values.to(self.config.torch_dtype)
+            encoded['pixel_values'] = pixel_values.to(self.model_info.torch_dtype)
         return encoded
 
 
@@ -252,8 +271,6 @@ class LLavaTemplate(Template):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
-        if len(encoded) == 0:
-            return encoded
         images = inputs.images or []
         image_sizes = [x.size for x in images]
         from llava.mm_utils import process_images

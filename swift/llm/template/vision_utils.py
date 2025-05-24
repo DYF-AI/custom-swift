@@ -4,16 +4,14 @@ import math
 import os
 import re
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Literal, TypeVar, Union
+from typing import Any, Callable, List, TypeVar, Union
 
 import numpy as np
 import requests
 import torch
-from packaging import version
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from swift.utils import get_env_args
-from .utils import Context
 
 # >>> internvl
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -55,7 +53,7 @@ def _dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbn
 
     # calculate the existing image aspect ratio
     target_ratios = set((i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1)
-                        if i * j <= max_num and i * j >= min_num)
+                        if min_num <= i * j <= max_num)
     target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
 
     # find the closest aspect ratio to the target
@@ -102,7 +100,7 @@ def rescale_image(img: Image.Image, max_pixels: int) -> Image.Image:
 _T = TypeVar('_T')
 
 
-def load_file(path: Union[str, _T]) -> Union[BytesIO, _T]:
+def load_file(path: Union[str, bytes, _T]) -> Union[BytesIO, _T]:
     res = path
     if isinstance(path, str):
         path = path.strip()
@@ -113,41 +111,25 @@ def load_file(path: Union[str, _T]) -> Union[BytesIO, _T]:
                 request_kwargs['timeout'] = timeout
             content = requests.get(path, **request_kwargs).content
             res = BytesIO(content)
-        elif os.path.exists(path):
+        elif os.path.exists(path) or (not path.startswith('data:') and len(path) <= 200):
+            path = os.path.abspath(os.path.expanduser(path))
             with open(path, 'rb') as f:
                 res = BytesIO(f.read())
         else:  # base64_str
-            import binascii
-            try:
-                data = path
-                if data.startswith('data:'):
-                    match_ = re.match(r'data:(.+?);base64,(.+)', data)
-                    assert match_ is not None
-                    data = match_.group(2)
-                data = base64.b64decode(data)
-                res = BytesIO(data)
-            except (ValueError, binascii.Error) as error:
-                if len(path) < 200:
-                    raise ValueError(f'invalid image: "{path}"')
-                else:
-                    raise ValueError(f'invalid image: {error}')
+            data = path
+            if data.startswith('data:'):
+                match_ = re.match(r'data:(.+?);base64,(.+)', data)
+                assert match_ is not None
+                data = match_.group(2)
+            data = base64.b64decode(data)
+            res = BytesIO(data)
     elif isinstance(path, bytes):
         res = BytesIO(path)
     return res
 
 
-def load_file_decorator(func):
-
-    def new_func(path, *args, **kwargs):
-        path = load_file(path)
-        res = func(path, *args, **kwargs)
-        return res
-
-    return new_func
-
-
-@load_file_decorator
-def load_image(image: Union[Image.Image, BytesIO]) -> Image.Image:
+def load_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
+    image = load_file(image)
     if isinstance(image, BytesIO):
         image = Image.open(image)
     if image.mode != 'RGB':
@@ -187,9 +169,9 @@ def transform_image(image, input_size=448, max_num=12):
     return pixel_values
 
 
-@load_file_decorator
-def load_video_internvl(video_io: BytesIO, bound=None, num_segments=32):
+def load_video_internvl(video: Union[str, bytes], bound=None, num_segments=32):
     from decord import VideoReader, cpu
+    video_io = load_file(video)
     vr = VideoReader(video_io, ctx=cpu(0), num_threads=1)
     max_frame = len(vr) - 1
     fps = float(vr.get_avg_fps())
@@ -201,20 +183,9 @@ def load_video_internvl(video_io: BytesIO, bound=None, num_segments=32):
     return images
 
 
-def draw_plot(img_dir: str, bbox: List[int], bbox_type: str, output_file: str):
-    image = Image.open(img_dir)
-
-    objects = [{'bbox': bbox, 'bbox_type': bbox_type, 'image': 0}]
-    normalize_bbox(objects, [image], 'real')
-    bbox = objects[0]['bbox']
-    draw = ImageDraw.Draw(image)
-    draw.rectangle(bbox, outline='red', width=2)
-    image.save(output_file)
-
-
-@load_file_decorator
-def load_video_cogvlm2(video_io: BytesIO) -> np.ndarray:
+def load_video_cogvlm2(video: Union[str, bytes]) -> np.ndarray:
     from decord import cpu, VideoReader, bridge
+    video_io = load_file(video)
     bridge.set_bridge('torch')
     clip_end_sec = 60
     clip_start_sec = 0
@@ -230,9 +201,9 @@ def load_video_cogvlm2(video_io: BytesIO) -> np.ndarray:
     return video_data
 
 
-@load_file_decorator
-def load_video_llava(video_io: BytesIO) -> np.ndarray:
+def load_video_llava(video: Union[str, bytes]) -> np.ndarray:
     import av
+    video_io = load_file(video)
     container = av.open(video_io)
     total_frames = container.streams.video[0].frames
     num_frames = get_env_args('num_frames', int, 16)
@@ -249,8 +220,8 @@ def load_video_llava(video_io: BytesIO) -> np.ndarray:
     return np.stack([x.to_ndarray(format='rgb24') for x in frames])
 
 
-@load_file_decorator
-def load_video_minicpmv_mplug_owl3(video_io: BytesIO, max_num_frames):
+def load_video_minicpmv_mplug_owl3(video: Union[str, bytes], max_num_frames):
+
     from decord import VideoReader, cpu  # pip install decord
 
     def uniform_sample(_l, _n):
@@ -258,6 +229,7 @@ def load_video_minicpmv_mplug_owl3(video_io: BytesIO, max_num_frames):
         idxs = [int(i * gap + gap / 2) for i in range(_n)]
         return [_l[i] for i in idxs]
 
+    video_io = load_file(video)
     vr = VideoReader(video_io, ctx=cpu(0))
     sample_fps = round(vr.get_avg_fps() / 1)  # FPS
     frame_idx = [i for i in range(0, len(vr), sample_fps)]
@@ -269,157 +241,35 @@ def load_video_minicpmv_mplug_owl3(video_io: BytesIO, max_num_frames):
     return frames
 
 
-@load_file_decorator
-def load_audio_qwen(audio_io: BytesIO, sampling_rate: int):
+def load_audio(audio: Union[str, bytes], sampling_rate: int, return_sr: bool = False):
     import librosa
-    return librosa.load(audio_io, sr=sampling_rate)[0]
+    audio_io = load_file(audio)
+    res = librosa.load(audio_io, sr=sampling_rate)
+    return res if return_sr else res[0]
 
 
-def load_video_qwen2(video_path: str):
-    import torchvision
-    from torchvision import io, transforms
-    from qwen_vl_utils.vision_process import (round_by_factor, FPS, FRAME_FACTOR, FPS_MIN_FRAMES, FPS_MAX_FRAMES,
-                                              VIDEO_MIN_PIXELS, VIDEO_MAX_PIXELS, VIDEO_TOTAL_PIXELS, smart_resize,
-                                              ceil_by_factor, floor_by_factor)
-    from torchvision.transforms import InterpolationMode
-
-    if version.parse(torchvision.__version__) >= version.parse('0.19'):
-        video_path = load_file(video_path)
-    video, _, info = io.read_video(
-        video_path,
-        pts_unit='sec',
-        output_format='TCHW',
-    )
-    nframes = get_env_args('nframes', int, None)
-    fps = get_env_args('fps', int, None)
-    size_factor = get_env_args('frame_factor', int, FRAME_FACTOR)
-    assert not (fps and nframes), 'Only accept either `fps` or `nframes`'
-    if nframes is not None:
-        nframes = round_by_factor(nframes, size_factor)
-    else:
-        if fps is None:
-            fps = FPS
-        nframes = video.size(0) / info['video_fps'] * fps
-        nframes = round_by_factor(nframes, size_factor)
-        min_frames = get_env_args('fps_min_frames', int, FPS_MIN_FRAMES)
-        max_frames = get_env_args('fps_max_frames', int, FPS_MAX_FRAMES)
-        if nframes < min_frames:
-            nframes = ceil_by_factor(min_frames, size_factor)
-        if nframes > max_frames:
-            nframes = floor_by_factor(max_frames, size_factor)
-
-    if not (size_factor <= nframes and nframes <= video.size(0)):
-        raise ValueError(f'nframes should in interval [{size_factor}, {video.size(0)}], but got {nframes}.')
-
-    idx = torch.linspace(0, video.size(0) - 1, nframes).round().long()
-    height, width = video.shape[2:]
-    video = video[idx]
-
-    min_pixels = get_env_args('video_min_pixels', int, VIDEO_MIN_PIXELS)
-    total_pixels = get_env_args('video_total_pixels', int, VIDEO_TOTAL_PIXELS)
-    max_pixels = get_env_args('video_max_pixels', int, None)
-    if max_pixels is None:
-        max_pixels = VIDEO_MAX_PIXELS
-        max_pixels = max(min(max_pixels, total_pixels / nframes * size_factor), min_pixels * 1.05)
-    # resize
-    resized_height = get_env_args('resized_height', int, None)
-    resized_width = get_env_args('resized_width', int, None)
-    if resized_height and resized_width:
-        resized_height, resized_width = smart_resize(
-            resized_height,
-            resized_width,
-            factor=size_factor,
-        )
-    else:
-        resized_height, resized_width = smart_resize(
-            height,
-            width,
-            factor=size_factor,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-
-    video = transforms.functional.resize(
-        video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).float()
-    return video
+def load_video_valley(video: Union[str, bytes]):
+    import decord
+    from torchvision import transforms
+    video_io = load_file(video)
+    video_reader = decord.VideoReader(video_io)
+    decord.bridge.set_bridge('torch')
+    video = video_reader.get_batch(np.linspace(0, len(video_reader) - 1, 8).astype(np.int_)).byte()
+    images = [transforms.ToPILImage()(image.permute(2, 0, 1)).convert('RGB') for image in video]
+    return images
 
 
-def normalize_bbox(objects: List[Dict[str, Any]], images: List[Image.Image], to_type: Literal['real', 'norm_1000',
-                                                                                              'norm_1']) -> None:
-    """Normalize bbox to needed.
-    to_type support real/norm_1000/norm_1, which literally means the coordinates in real, or normalized by 1000,
-        or normalized by 1.
-
-    Args:
-        objects: The objects containing the bbox
-        images: The images list
-        to_type: The coordinate type needed by the model.
-    """
-    if not objects or not images:
-        return
-
-    for object_ in objects:
-        bbox = object_['bbox']
-        bbox_type = object_['bbox_type']
-        idx = object_['image']
-        image = images[idx]
-        if bbox_type == 'real':
-            if to_type == 'real':
-                continue
-            width, height = image.width, image.height
-            if isinstance(bbox[0], list):
-                bboxes = []
-                for _box in bbox:
-                    bboxes.append([
-                        int(coord / dim * 999) if to_type == 'norm_1000' else coord / dim
-                        for coord, dim in zip(_box, [width, height, width, height])
-                    ])
-                object_['bbox'] = bboxes
-            else:
-                object_['bbox'] = [
-                    int(coord / dim * 999) if to_type == 'norm_1000' else coord / dim
-                    for coord, dim in zip(bbox, [width, height, width, height])
-                ]
-            object_['bbox_type'] = to_type
-        elif bbox_type == 'norm_1000':
-            if to_type == 'norm_1000':
-                continue
-            if to_type == 'norm_1':
-                object_['bbox'] = [coord / 999. for coord in bbox]
-            elif to_type == 'real':
-                width, height = image.width, image.height
-                object_['bbox'] = [int(coord / 999. * dim) for coord, dim in zip(bbox, [width, height, width, height])]
-            object_['bbox_type'] = to_type
-        elif bbox_type == 'norm_1':
-            if to_type == 'norm_1':
-                continue
-            if to_type == 'norm_1000':
-                object_['bbox'] = [int(coord * 999) for coord in bbox]
-            elif to_type == 'real':
-                width, height = image.width, image.height
-                object_['bbox'] = [int(coord * dim) for coord, dim in zip(bbox, [width, height, width, height])]
-            object_['bbox_type'] = to_type
-
-
-def replace_video2image(load_video_func, inputs, replace_tag: Callable) -> List[Context]:
-    context_list = []
-    video_idx = inputs.video_idx
-    video = inputs.videos[video_idx]
-    images = inputs.images
-    image_idx = inputs.image_idx
-    new_images = load_video_func(video)
-    inputs.images = images[:image_idx] + new_images + images[image_idx:]
-    for i in range(len(new_images)):
-        context_list += replace_tag(i)
-    inputs.image_idx += len(new_images)
-    return context_list
-
-
-if __name__ == '__main__':
-    # TODO:remove
-    # A test main to draw bbox
-    draw_plot('man.jpg', [354, 462, 580, 738], 'norm_1000', 'man_bbox.jpg')
+def load_video_ovis2(video_path, num_frames):
+    from moviepy.editor import VideoFileClip
+    with VideoFileClip(video_path) as clip:
+        total_frames = int(clip.fps * clip.duration)
+        if total_frames <= num_frames:
+            sampled_indices = range(total_frames)
+        else:
+            stride = total_frames / num_frames
+            sampled_indices = [
+                min(total_frames - 1, int((stride * i + stride * (i + 1)) / 2)) for i in range(num_frames)
+            ]
+        frames = [clip.get_frame(index / clip.fps) for index in sampled_indices]
+        frames = [Image.fromarray(frame, mode='RGB') for frame in frames]
+    return frames

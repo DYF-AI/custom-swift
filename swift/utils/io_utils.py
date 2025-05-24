@@ -1,12 +1,17 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-from contextlib import contextmanager
-from typing import Any, Dict, List, Union
+import os
+from queue import Queue
+from threading import Thread
+from typing import Any, Dict, List, Literal, Union
 
 import json
 import requests
+import torch.distributed as dist
+from accelerate.utils import gather_object
 from modelscope.hub.api import ModelScopeConfig
 from tqdm import tqdm
 
+from .env import is_master
 from .logger import get_logger
 from .utils import check_json_format
 
@@ -41,52 +46,73 @@ def write_to_jsonl(fpath: str, obj_list: List[Any], encoding: str = 'utf-8') -> 
 
 class JsonlWriter:
 
-    def __init__(self, fpath: str, *, buffer_size: int = 0, encoding: str = 'utf-8', strict: bool = True):
-        self.fpath = fpath
-        self.buffer_size = buffer_size
+    def __init__(self, fpath: str, *, encoding: str = 'utf-8', strict: bool = True, enable_async: bool = False):
+        self.fpath = os.path.abspath(os.path.expanduser(fpath)) if is_master() else None
         self.encoding = encoding
         self.strict = strict
+        self.enable_async = enable_async
+        self._queue = Queue()
+        self._thread = None
 
-        self._cache_text = ''
+    def _append_worker(self):
+        while True:
+            item = self._queue.get()
+            self._append(**item)
 
-    def append(self, obj: Union[Dict, List[Dict]]):
+    def _append(self, obj: Union[Dict, List[Dict]], gather_obj: bool = False):
         if isinstance(obj, (list, tuple)) and all(isinstance(item, dict) for item in obj):
             obj_list = obj
         else:
             obj_list = [obj]
-        obj_list = check_json_format(obj_list)
-        for _obj in obj_list:
-            self._cache_text += f'{json.dumps(_obj, ensure_ascii=False)}\n'
-
-        if len(self._cache_text) >= self.buffer_size:
-            self._write_buffer()
-
-    def close(self):
-        self._write_buffer()
-
-    def _write_buffer(self):
-        if not self._cache_text:
+        if gather_obj and dist.is_initialized():
+            obj_list = gather_object(obj_list)
+        if not is_master():
             return
+        obj_list = check_json_format(obj_list)
+        for i, _obj in enumerate(obj_list):
+            obj_list[i] = json.dumps(_obj, ensure_ascii=False) + '\n'
+        self._write_buffer(''.join(obj_list))
+
+    def append(self, obj: Union[Dict, List[Dict]], gather_obj: bool = False):
+        if self.enable_async:
+            if self._thread is None:
+                self._thread = Thread(target=self._append_worker, daemon=True)
+                self._thread.start()
+            self._queue.put({'obj': obj, 'gather_obj': gather_obj})
+        else:
+            self._append(obj, gather_obj=gather_obj)
+
+    def _write_buffer(self, text: str):
+        if not text:
+            return
+        assert is_master(), f'is_master(): {is_master()}'
         try:
+            os.makedirs(os.path.dirname(self.fpath), exist_ok=True)
             with open(self.fpath, 'a', encoding=self.encoding) as f:
-                f.write(self._cache_text)
+                f.write(text)
         except Exception:
             if self.strict:
                 raise
-            logger.error(f'Cannot write content to jsonl file. cache_text: {self._cache_text}')
-        finally:
-            self._cache_text = ''
-
-
-@contextmanager
-def open_jsonl_writer(fpath: str, *, buffer_size: int = 0, encoding: str = 'utf-8', strict: bool = True):
-    json_writer = JsonlWriter(fpath, buffer_size=buffer_size, encoding=encoding, strict=strict)
-    try:
-        yield json_writer
-    finally:
-        json_writer.close()
+            logger.error(f'Cannot write content to jsonl file. text: {text}')
 
 
 def append_to_jsonl(fpath: str, obj: Union[Dict, List[Dict]], *, encoding: str = 'utf-8', strict: bool = True) -> None:
-    with open_jsonl_writer(fpath, encoding=encoding, strict=strict) as jsonl_writer:
-        jsonl_writer.append(obj)
+    jsonl_writer = JsonlWriter(fpath, encoding=encoding, strict=strict)
+    jsonl_writer.append(obj)
+
+
+def get_file_mm_type(file_name: str) -> Literal['image', 'video', 'audio']:
+    video_extensions = {'.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm'}
+    audio_extensions = {'.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a'}
+    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+
+    _, ext = os.path.splitext(file_name)
+
+    if ext.lower() in video_extensions:
+        return 'video'
+    elif ext.lower() in audio_extensions:
+        return 'audio'
+    elif ext.lower() in image_extensions:
+        return 'image'
+    else:
+        raise ValueError(f'file_name: {file_name}, ext: {ext}')

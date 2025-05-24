@@ -12,9 +12,9 @@ from ..constant import LLMTemplateType, MLLMTemplateType
 from ..register import TemplateMeta, register_template
 from ..template_inputs import StdTemplateInputs
 from ..utils import Context, Prompt, findall
-from ..vision_utils import load_video_minicpmv_mplug_owl3, replace_video2image
+from ..vision_utils import load_video_minicpmv_mplug_owl3
 from .llama import Llama3TemplateMeta
-from .qwen import QwenTemplateMeta
+from .qwen import Qwen2_5TemplateMeta, QwenTemplateMeta
 
 
 @dataclass
@@ -41,6 +41,7 @@ class MiniCPMVTemplate(Template):
     is_v2_5 = False
     use_model = True
     skip_prompt = False
+    placeholder_tokens = ['<unk>']
 
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
@@ -49,7 +50,7 @@ class MiniCPMVTemplate(Template):
         else:
             return [[-100]]
 
-    async def prepare_lmdeploy_inputs(self, inputs: Dict[str, Any]) -> None:
+    async def prepare_lmdeploy_turbomind_inputs(self, inputs: Dict[str, Any]) -> None:
         images = inputs.pop('images', None) or []
         if len(images) == 0:
             return
@@ -76,12 +77,10 @@ class MiniCPMVTemplate(Template):
         new_input_ids += input_ids[idx_list[-1] + 1:]
         inputs['input_ids'] = new_input_ids
         inputs['images'] = features
-        await super().prepare_lmdeploy_inputs(inputs)
+        await super().prepare_lmdeploy_turbomind_inputs(inputs)
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
-        if len(encoded) == 0:
-            return encoded
         images = inputs.images
         input_ids = encoded['input_ids']
         labels = encoded['labels']
@@ -92,7 +91,7 @@ class MiniCPMVTemplate(Template):
         if slice_mode:
             if self.is_v2_5:
                 image_processor = self.processor.image_processor
-                image_inputs = image_processor(images, return_tensors='pt').to(self.config.torch_dtype)
+                image_inputs = image_processor(images, return_tensors='pt').to(self.model_info.torch_dtype)
                 placeholder = image_processor.get_slice_image_placeholder(image_inputs.image_sizes[0][0])
                 pixel_values = image_inputs['pixel_values']
                 tgt_sizes = image_inputs['tgt_sizes']
@@ -149,12 +148,10 @@ class MiniCPMV2_5Template(MiniCPMVTemplate):
     is_v2_5 = True
 
 
-register_template(
-    Llama3TemplateMeta(
-        MLLMTemplateType.minicpmv2_5,
-        template_cls=MiniCPMV2_5Template,
-        placeholder_tokens=['<unk>'],
-    ))
+register_template(Llama3TemplateMeta(
+    MLLMTemplateType.minicpmv2_5,
+    template_cls=MiniCPMV2_5Template,
+))
 
 
 class MiniCPMV2_6Template(MiniCPMVTemplate):
@@ -168,48 +165,34 @@ class MiniCPMV2_6Template(MiniCPMVTemplate):
         if media_type == 'image':
             return image_context
         elif media_type == 'video':
-            return replace_video2image(load_video, inputs, lambda i: image_context)
+            return self.replace_video2image(load_video, inputs, lambda i: image_context)
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = Template._encode(self, inputs)
-        if len(encoded) == 0:
-            return encoded
         images = inputs.images
         use_video = bool(inputs.videos)
-        is_plain_text = not images and not use_video
         use_image_id = True
-        max_slice_nums = None
-
+        max_slice_nums = get_env_args('max_slice_nums', int, None)
+        video_max_slice_nums = get_env_args('video_max_slice_nums', int, 1)  # or 2
         if use_video:
+            max_slice_nums = video_max_slice_nums
             use_image_id = False
-            max_slice_nums = 1  # or 2
-
-        max_slice_nums = get_env_args('max_slice_nums', int, max_slice_nums)
         input_ids = encoded['input_ids']
         labels = encoded['labels']
         idx_list = findall(input_ids, -100)
-        idx_list.insert(0, -1)
 
         image_processor = self.processor.image_processor
         image_inputs = image_processor([images], return_tensors='pt',
-                                       max_slice_nums=max_slice_nums).to(self.config.torch_dtype)
+                                       max_slice_nums=max_slice_nums).to(self.model_info.torch_dtype)
 
-        res_input_ids = []
-        res_labels = []
-        for i in range(len(idx_list) - 1):
+        def _get_new_tokens(i):
             placeholder = image_processor.get_slice_image_placeholder(
                 image_inputs.image_sizes[0][i], image_idx=i, max_slice_nums=max_slice_nums, use_image_id=use_image_id)
             placeholder += '\n'
-            placeholder_id = self.processor.encode(placeholder, add_special_tokens=False)
-            res_input_ids += input_ids[idx_list[i] + 1:idx_list[i + 1]] + placeholder_id
-            if labels is not None:
-                res_labels += labels[idx_list[i] + 1:idx_list[i + 1]] + [-100] * len(placeholder_id)
-        res_input_ids += input_ids[idx_list[-1] + 1:]
-        input_ids = res_input_ids
-        if labels is not None:
-            res_labels += labels[idx_list[-1] + 1:]
-            labels = res_labels
-        if not is_plain_text:
+            return self.processor.encode(placeholder, add_special_tokens=False)
+
+        input_ids, labels = self._extend_tokens(input_ids, labels, idx_list, _get_new_tokens)
+        if inputs.images:
             input_tensor_ids = torch.tensor(input_ids)
             unk_token = self.processor.encode('<unk>', add_special_tokens=False)[0]
             indices = (input_tensor_ids == unk_token).nonzero(as_tuple=True)[0].tolist()
@@ -235,9 +218,12 @@ class MiniCPMV2_6Template(MiniCPMVTemplate):
         return encoded
 
 
-register_template(
-    QwenTemplateMeta(
-        MLLMTemplateType.minicpmv2_6,
-        template_cls=MiniCPMV2_6Template,
-        placeholder_tokens=['<unk>'],
-    ))
+register_template(QwenTemplateMeta(
+    MLLMTemplateType.minicpmv2_6,
+    template_cls=MiniCPMV2_6Template,
+))
+
+register_template(Qwen2_5TemplateMeta(
+    MLLMTemplateType.minicpmo2_6,
+    template_cls=MiniCPMV2_6Template,
+))

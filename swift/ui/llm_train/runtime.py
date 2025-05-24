@@ -30,7 +30,7 @@ class Runtime(BaseUI):
 
     all_plots = None
 
-    log_event = None
+    log_event = {}
 
     sft_plot = [
         {
@@ -120,6 +120,29 @@ class Runtime(BaseUI):
         },
         {
             'name': 'train/log_odds_ratio',
+            'smooth': 0.9,
+        },
+    ]
+
+    grpo_plot = [
+        {
+            'name': 'train/loss',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'train/reward',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'train/learning_rate',
+            'smooth': None,
+        },
+        {
+            'name': 'train/completions/mean_length',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'train/kl',
             'smooth': 0.9,
         },
     ]
@@ -253,13 +276,13 @@ class Runtime(BaseUI):
                 concurrency_limit = {}
                 if version.parse(gr.__version__) >= version.parse('4.0.0'):
                     concurrency_limit = {'concurrency_limit': 5}
-                cls.log_event = base_tab.element('show_log').click(
+                base_tab.element('show_log').click(
                     Runtime.update_log, [base_tab.element('running_tasks')], [cls.element('log')] + cls.all_plots).then(
                         Runtime.wait, [base_tab.element('logging_dir'),
                                        base_tab.element('running_tasks')], [cls.element('log')] + cls.all_plots,
                         **concurrency_limit)
 
-                base_tab.element('stop_show_log').click(lambda: None, cancels=cls.log_event)
+                base_tab.element('stop_show_log').click(cls.break_log_event, [cls.element('running_tasks')], [])
 
                 base_tab.element('start_tb').click(
                     Runtime.start_tb,
@@ -292,6 +315,8 @@ class Runtime(BaseUI):
             return cls.kto_plot
         elif train_type == 'orpo':
             return cls.orpo_plot
+        elif train_type == 'grpo':
+            return cls.grpo_plot
 
     @classmethod
     def update_log(cls, task):
@@ -315,11 +340,12 @@ class Runtime(BaseUI):
         if not logging_dir:
             return [None] + Runtime.plot(task)
         log_file = os.path.join(logging_dir, 'run.log')
+        cls.log_event[logging_dir] = False
         offset = 0
         latest_data = ''
         lines = collections.deque(maxlen=int(os.environ.get('MAX_LOG_LINES', 50)))
         try:
-            with open(log_file, 'r') as input:
+            with open(log_file, 'r', encoding='utf-8') as input:
                 input.seek(offset)
                 fail_cnt = 0
                 while True:
@@ -332,6 +358,10 @@ class Runtime(BaseUI):
                         fail_cnt += 1
                         if fail_cnt > 50:
                             break
+
+                    if cls.log_event.get(logging_dir, False):
+                        cls.log_event[logging_dir] = False
+                        break
 
                     if '\n' not in latest_data:
                         continue
@@ -354,6 +384,13 @@ class Runtime(BaseUI):
                     yield ['\n'.join(lines)] + Runtime.plot(task)
         except IOError:
             pass
+
+    @classmethod
+    def break_log_event(cls, task):
+        if not task:
+            return
+        pid, all_args = Runtime.parse_info_from_cmdline(task)
+        cls.log_event[all_args['logging_dir']] = True
 
     @classmethod
     def show_log(cls, logging_dir):
@@ -451,8 +488,8 @@ class Runtime(BaseUI):
             all_args[splits[0]] = splits[1]
 
         output_dir = all_args['output_dir']
-        if os.path.exists(os.path.join(output_dir, 'sft_args.json')):
-            with open(os.path.join(output_dir, 'sft_args.json'), 'r') as f:
+        if os.path.exists(os.path.join(output_dir, 'args.json')):
+            with open(os.path.join(output_dir, 'args.json'), 'r', encoding='utf-8') as f:
                 _json = json.load(f)
             for key in all_args.keys():
                 all_args[key] = _json.get(key)
@@ -464,13 +501,15 @@ class Runtime(BaseUI):
 
     @staticmethod
     def kill_task(task):
-        pid, all_args = Runtime.parse_info_from_cmdline(task)
-        output_dir = all_args['output_dir']
-        if sys.platform == 'win32':
-            os.system(f'taskkill /f /t /pid "{pid}"')
-        else:
-            os.system(f'pkill -9 -f {output_dir}')
-        time.sleep(1)
+        if task:
+            pid, all_args = Runtime.parse_info_from_cmdline(task)
+            output_dir = all_args['output_dir']
+            if sys.platform == 'win32':
+                os.system(f'taskkill /f /t /pid "{pid}"')
+            else:
+                os.system(f'pkill -9 -f {output_dir}')
+            time.sleep(1)
+            Runtime.break_log_event(task)
         return [Runtime.refresh_tasks()] + [gr.update(value=None)] * (len(Runtime.get_plot(task)) + 1)
 
     @staticmethod
@@ -494,6 +533,7 @@ class Runtime(BaseUI):
                 ret.append(gr.update(value=arg))
             else:
                 ret.append(gr.update())
+        Runtime.break_log_event(task)
         return ret + [gr.update(value=None)] * (len(Runtime.get_plot(task)) + 1)
 
     @staticmethod
@@ -520,6 +560,16 @@ class Runtime(BaseUI):
         for k in plot:
             name = k['name']
             smooth = k['smooth']
+            if name == 'train/acc':
+                if 'train/token_acc' in data:
+                    name = 'train/token_acc'
+                if 'train/seq_acc' in data:
+                    name = 'train/seq_acc'
+            if name == 'eval/acc':
+                if 'eval/token_acc' in data:
+                    name = 'eval/token_acc'
+                if 'eval/seq_acc' in data:
+                    name = 'eval/seq_acc'
             if name not in data:
                 plots.append(None)
                 continue
