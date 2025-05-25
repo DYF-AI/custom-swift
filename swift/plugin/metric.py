@@ -129,6 +129,83 @@ def compute_nlg_metrics(prediction) -> Dict[str, float]:
     return compute_rouge_bleu(new_preds, new_labels)
 
 
+def calculate_iou(boxA, boxB):
+    """
+    计算两个边界框的 IoU。
+    :param boxA: 第一个边界框 [x1, y1, x2, y2]
+    :param boxB: 第二个边界框 [x1, y1, x2, y2]
+    :return: IoU 值
+    """
+    # 计算交集区域的坐标
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    # 计算交集区域的宽和高
+    inter_width = xB - xA
+    inter_height = yB - yA
+
+    # 处理无交集情况
+    if inter_width <= 0 or inter_height <= 0:
+        return 0.0
+
+    # 计算交集和并集面积
+    inter_area = inter_width * inter_height
+    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    union_area = areaA + areaB - inter_area
+
+    # 计算 IoU
+    iou = inter_area / union_area
+    return iou
+
+import re
+import json
+
+
+def compute_iou(new_preds, new_labels):
+    """
+    支持容错的 IoU 计算：用正则提取 JSON 结构，解析失败时返回 0
+    :param new_preds: 预测框的字符串列表，如 ['```json[{"bbox_2d": [...]}]```', ...]
+    :param new_labels: 标签框的字符串列表
+    :return: (iou_list, avg_iou)
+    """
+    # 正则提取 ```json 包裹的 JSON 内容（兼容多余字符）
+    json_pattern = re.compile(r"```json(.*?)```", re.DOTALL)
+    iou_list = []
+
+    for pred_str, label_str in zip(new_preds, new_labels):
+        try:
+            # 提取预测框 JSON 部分
+            pred_json_str = json_pattern.search(pred_str).group(1).strip()
+            pred_data = json.loads(pred_json_str)
+            pred_box = pred_data[0]["bbox_2d"]  # 假设每个元素是列表且第一个对象含 bbox_2d
+
+            # 提取标签框 JSON 部分
+            label_json_str = json_pattern.search(label_str).group(1).strip()
+            label_data = json.loads(label_json_str)
+            label_box = label_data[0]["bbox_2d"]
+
+            # 计算 IoU
+            iou = calculate_iou(pred_box, label_box)
+            iou_list.append(iou)
+        except (AttributeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+            # 捕获所有可能的解析错误（正则未匹配、JSON 格式错误、键缺失、索引越界、类型错误）
+            iou_list.append(0.0)
+
+    avg_iou = sum(iou_list) / len(iou_list) if iou_list else 0.0
+    return iou_list, avg_iou
+
+
+def compute_iou_metrics(prediction) -> Dict[str, float]:
+    preds, labels = prediction[0], prediction[1]
+    new_preds, new_labels = [], []
+    for i in range(preds.shape[0]):
+        new_preds.append(Serializer.from_tensor(preds[i]))
+        new_labels.append(Serializer.from_tensor(labels[i]))
+    return compute_iou(new_preds, new_labels)
+
 def compute_acc(preds,
                 labels,
                 *,
