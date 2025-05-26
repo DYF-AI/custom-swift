@@ -129,83 +129,90 @@ def compute_nlg_metrics(prediction) -> Dict[str, float]:
     return compute_rouge_bleu(new_preds, new_labels)
 
 
-def calculate_iou(boxA, boxB):
+def cal_iou(pred_bbox, gt_bbox):
     """
-    计算两个边界框的 IoU。
-    :param boxA: 第一个边界框 [x1, y1, x2, y2]
-    :param boxB: 第二个边界框 [x1, y1, x2, y2]
-    :return: IoU 值
+        计算iou
     """
-    # 计算交集区域的坐标
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
+    if pred_bbox is None or gt_bbox is None:
+        return 0.0  # Return 0 IoU if either box is None
+    # Determine the coordinates of the intersection rectangle
+    x_left = max(pred_bbox[0], gt_bbox[0])
+    y_top = max(pred_bbox[1], gt_bbox[1])
+    x_right = min(pred_bbox[2], gt_bbox[2])
+    y_bottom = min(pred_bbox[3], gt_bbox[3])
 
-    # 计算交集区域的宽和高
-    inter_width = xB - xA
-    inter_height = yB - yA
-
-    # 处理无交集情况
-    if inter_width <= 0 or inter_height <= 0:
+    # If there's no intersection, return 0
+    if x_right < x_left or y_bottom < y_top:
         return 0.0
 
-    # 计算交集和并集面积
-    inter_area = inter_width * inter_height
-    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    union_area = areaA + areaB - inter_area
+    # Calculate intersection area
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
 
-    # 计算 IoU
-    iou = inter_area / union_area
+    # Calculate areas of each bounding box
+    pred_area = (pred_bbox[2] - pred_bbox[0]) * (pred_bbox[3] - pred_bbox[1])
+    gt_area = (gt_bbox[2] - gt_bbox[0]) * (gt_bbox[3] - gt_bbox[1])
+
+    # Calculate union area
+    union_area = pred_area + gt_area - intersection_area
+
+    # Calculate IoU
+    iou = intersection_area / union_area
+
     return iou
 
+
+def check_bb(pred_bbox, gt_bbox):
+    """
+        判断预测的pred_bbox的中心点是否在gt_bbox里面
+    """
+    if pred_bbox is None or gt_bbox is None:
+        # print("pred_bbox is None or gt_bbox is None")
+        return False
+    pred_center = [(pred_bbox[0] + pred_bbox[2]) / 2, (pred_bbox[1] + pred_bbox[3]) / 2]
+    if pred_center[0] >= gt_bbox[0] and pred_center[0] <= gt_bbox[2] and pred_center[1] >= gt_bbox[1] and pred_center[
+        1] <= gt_bbox[3]:
+        return True
+    else:
+        return False
+
+
 import re
-import json
 
 
-def compute_iou(new_preds, new_labels):
+def extract_bbox(s):
     """
-    支持容错的 IoU 计算：用正则提取 JSON 结构，解析失败时返回 0
-    :param new_preds: 预测框的字符串列表，如 ['```json[{"bbox_2d": [...]}]```', ...]
-    :param new_labels: 标签框的字符串列表
-    :return: (iou_list, avg_iou)
+        抽取x1, y1, x2, y2, 可以使用json进行解析，暂时使用正则问题也不大
     """
-    # 正则提取 ```json 包裹的 JSON 内容（兼容多余字符）
-    json_pattern = re.compile(r"```json(.*?)```", re.DOTALL)
-    iou_list = []
-
-    for pred_str, label_str in zip(new_preds, new_labels):
-        try:
-            # 提取预测框 JSON 部分
-            pred_json_str = json_pattern.search(pred_str).group(1).strip()
-            pred_data = json.loads(pred_json_str)
-            pred_box = pred_data[0]["bbox_2d"]  # 假设每个元素是列表且第一个对象含 bbox_2d
-
-            # 提取标签框 JSON 部分
-            label_json_str = json_pattern.search(label_str).group(1).strip()
-            label_data = json.loads(label_json_str)
-            label_box = label_data[0]["bbox_2d"]
-
-            # 计算 IoU
-            iou = calculate_iou(pred_box, label_box)
-            iou_list.append(iou)
-        except (AttributeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-            # 捕获所有可能的解析错误（正则未匹配、JSON 格式错误、键缺失、索引越界、类型错误）
-            iou_list.append(0.0)
-
-    avg_iou = sum(iou_list) / len(iou_list) if iou_list else 0.0
-    return iou_list, avg_iou
+    pattern = r'"bbox_2d": *\[(\d+), *(\d+), *(\d+), *(\d+)\]'
+    match = re.search(pattern, s)
+    if match:
+        return [float(match.group(1)), float(match.group(2)), float(match.group(3)), float(match.group(4))]
+    return None
 
 
-def compute_iou_metrics(prediction) -> Dict[str, float]:
+def compute_gr_iou_metrics(prediction) -> Dict[str, float]:
+    """
+        计算iou指标和bbox_acc指标
+    """
+
     preds, labels = prediction[0], prediction[1]
     new_preds, new_labels = [], []
     for i in range(preds.shape[0]):
+        # 序列化为可读文本
         new_preds.append(Serializer.from_tensor(preds[i]))
         new_labels.append(Serializer.from_tensor(labels[i]))
-    return compute_iou(new_preds, new_labels)
 
+    correct_num, pre_num, all_iou = 0, len(new_preds), 0
+    for pred, label in zip(new_preds, new_labels):
+        # 对pred和gt进行bbox的正则抽取
+        pred_bbox, label_bbox = extract_bbox(pred), extract_bbox(label)
+        if check_bb(pred_bbox, label_bbox):
+            correct_num += 1
+        iou = cal_iou(pred_bbox, label_bbox)
+        all_iou += iou
+    avg_iou = all_iou / pre_num
+    acc = correct_num / pre_num
+    return {'bbox_acc': acc, 'iou': avg_iou}
 def compute_acc(preds,
                 labels,
                 *,
@@ -259,6 +266,7 @@ def preprocess_logits_for_acc(logits: torch.Tensor, labels: torch.Tensor) -> tor
 METRIC_MAPPING = {
     'acc': (compute_acc_metrics, preprocess_logits_for_acc),
     'nlg': (compute_nlg_metrics, None),
+    'iou': (compute_gr_iou_metrics, None),
 }
 
 
