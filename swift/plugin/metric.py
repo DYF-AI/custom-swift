@@ -169,8 +169,8 @@ def check_bb(pred_bbox, gt_bbox):
         # print("pred_bbox is None or gt_bbox is None")
         return False
     pred_center = [(pred_bbox[0] + pred_bbox[2]) / 2, (pred_bbox[1] + pred_bbox[3]) / 2]
-    if pred_center[0] >= gt_bbox[0] and pred_center[0] <= gt_bbox[2] and pred_center[1] >= gt_bbox[1] and pred_center[
-        1] <= gt_bbox[3]:
+    if gt_bbox[0] <= pred_center[0] <= gt_bbox[2] and \
+            gt_bbox[1] <= pred_center[1] <= gt_bbox[3]:
         return True
     else:
         return False
