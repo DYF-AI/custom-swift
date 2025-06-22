@@ -47,6 +47,7 @@ def llm_worker(args: DeployArguments, data_parallel_rank: int, master_port: int,
     kwargs = {}
     if args.tensor_parallel_size == 1 and args.data_parallel_size > 1:
         kwargs['device'] = get_device(str(data_parallel_rank))
+    kwargs['template'] = args.get_template(None)
     engine = SwiftRolloutDeploy.get_infer_engine(args, **kwargs)
 
     # Send ready signal to parent process
@@ -86,7 +87,6 @@ class SwiftRolloutDeploy(SwiftPipeline):
         self.app.post('/infer/', response_model=None)(self.infer)
 
     def __init__(self, args: Union[List[str], DeployArguments, None] = None):
-        os.environ['VLLM_USE_V1'] = os.environ.get('VLLM_USE_V1', '1')
         super().__init__(args)
         safe_set_start_method()
         self.app = FastAPI(lifespan=self.lifespan)
@@ -125,12 +125,13 @@ class SwiftRolloutDeploy(SwiftPipeline):
                 process.join()  # ensure process termination after calling terminate()
 
     @staticmethod
-    def get_infer_engine(args: InferArguments, **kwargs):
+    def get_infer_engine(args: InferArguments, template=None, **kwargs):
         kwargs.update({
             'model_id_or_path': args.model,
             'model_type': args.model_type,
             'revision': args.model_revision,
             'torch_dtype': args.torch_dtype,
+            'template': template,
         })
         infer_backend = kwargs.pop('infer_backend', None) or args.infer_backend
         if infer_backend != 'vllm':
@@ -252,7 +253,8 @@ class SwiftRolloutDeploy(SwiftPipeline):
             if not requests:
                 requests = RolloutInferRequest(messages=[{'role': 'user', 'content': '<placeholder>'}])
             # different seed bewteen vLLM Engine
-            request_config.seed += i * len(requests)
+            if request_config.seed:
+                request_config.seed += i * len(requests)
             kwargs = {'infer_requests': requests, 'request_config': request_config, 'use_tqdm': use_tqdm}
             connection.send({'type': 'call', 'method': 'infer', 'kwargs': kwargs})
 
