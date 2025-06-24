@@ -393,6 +393,39 @@ class SoftOverlong(ORM):
             rewards.append(min(-exceed_len / self.soft_cache_length, 0))
         return rewards
 
+def extract_last_bbox(s):
+    """
+        抽取x1, y1, x2, y2, 可以使用json进行解析，暂时使用正则问题也不大
+        修改为抽取最后一个匹配的正则
+    """
+    pattern = r'"bbox_2d": *\[(\d+), *(\d+), *(\d+), *(\d+)\]'
+    matches = re.findall(pattern, s)
+    if matches:
+        last_match = matches[-1]
+        return [float(last_match[0]), float(last_match[1]), float(last_match[2]), float(last_match[3])]
+    return None
+
+def extract_last_point(s):
+    """
+        抽取x1, y1, x2, y2, 可以使用json进行解析，暂时使用正则问题也不大
+        修改为抽取最后一个匹配的正则
+    """
+    pattern = r'"point_2d": *\[(\d+), *(\d+)\]'
+    matches = re.findall(pattern, s)
+    if matches:
+        last_match = matches[-1]
+        return [float(last_match[0]), float(last_match[1]), float(last_match[2]), float(last_match[3])]
+    return None
+
+class RewardBBoxAcc(ORM):
+
+    def __call__(self, completions, **kwargs) -> List[float]:
+        pass
+
+class RewardPointAcc(ORM):
+
+    def __call__(self, completions, **kwargs) -> List[float]:
+        pass
 
 orms = {
     'toolbench': ReactORM,
@@ -403,4 +436,6 @@ orms = {
     'cosine': CosineReward,
     'repetition': RepetitionPenalty,
     'soft_overlong': SoftOverlong,
+    'reward_bbox_acc': RewardBBoxAcc,
+    'reward_point_acc': RewardPointAcc,
 }
