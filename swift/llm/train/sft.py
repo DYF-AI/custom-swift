@@ -11,8 +11,7 @@ from swift.utils import (append_to_jsonl, get_logger, get_model_parameter_info, 
                          use_torchacc)
 from ..argument import TrainArguments
 from ..base import SwiftPipeline
-from ..dataset import (EncodePreprocessor, GetLengthPreprocessor, IterablePackingDataset, LazyLLMDataset,
-                       PackingDataset, load_dataset)
+from ..dataset import EncodePreprocessor, IterablePackingDataset, LazyLLMDataset, PackingDataset, load_dataset
 from ..infer import prepare_generation_config
 from .tuner import TunerMixin
 
@@ -75,22 +74,16 @@ class SwiftSft(SwiftPipeline, TunerMixin):
 
         return train_dataset, val_dataset
 
-    def _get_loss_func(self):
-        args = self.args
-        loss_type = args.loss_type
-        if loss_type is None and args.loss_scale != 'default':
-            loss_type = 'loss_scale'
-        return get_loss_func(loss_type)
-
     def _get_data_collator(self):
         args = self.args
         template = self.template
         padding_to = args.max_length if args.train_type == 'longlora' else None
         return partial(template.data_collator, padding_to=padding_to)
 
-    @staticmethod
-    def _save_val_dataset(output_dir: str, val_dataset):
-        if is_master() and isinstance(val_dataset, HfDataset):
+    def _save_val_dataset(self, val_dataset):
+        args = self.args
+        output_dir = getattr(args, 'output_dir', None) or getattr(args, 'save')
+        if is_master() and isinstance(val_dataset, HfDataset) and not args.val_dataset:
             os.makedirs(output_dir, exist_ok=True)
             val_dataset_path = os.path.join(output_dir, 'val_dataset.jsonl')
             append_to_jsonl(val_dataset_path, val_dataset.to_list())
@@ -141,18 +134,19 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         return {
             'compute_metrics': compute_metrics,
             'preprocess_logits_for_metrics': preprocess_logits_for_metrics,
-            'compute_loss_func': self._get_loss_func()
+            'compute_loss_func': get_loss_func(args.loss_type)
         }
 
     def _save_trainer_state(self, trainer):
         training_args = trainer.args
         state = trainer.state
         if hasattr(state, 'last_model_checkpoint'):
-            if is_master() and self.args.create_checkpoint_symlink:
+            if self.args.create_checkpoint_symlink:
                 last_checkpoint = os.path.join(self.args.output_dir, 'last')
                 best_checkpoint = os.path.join(self.args.output_dir, 'best')
-                os.symlink(state.last_model_checkpoint, last_checkpoint)
-                os.symlink(state.best_model_checkpoint, best_checkpoint)
+                if is_master():
+                    os.symlink(state.last_model_checkpoint, last_checkpoint)
+                    os.symlink(state.best_model_checkpoint, best_checkpoint)
                 state.last_model_checkpoint = last_checkpoint
                 state.best_model_checkpoint = best_checkpoint
         else:
@@ -210,9 +204,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         self.callbacks = callbacks
 
     def _stat_dataset(self, dataset: Union[HfDataset, PackingDataset]):
-        args = self.args
         if isinstance(dataset, HfDataset):
-            dataset = GetLengthPreprocessor()(dataset, num_proc=args.dataset_num_proc)
             length = dataset['length']
         else:
             length = dataset.packed_dataset.length_list
@@ -223,18 +215,25 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def _encode_dataset(self, train_dataset, val_dataset):
         template = self.template
         args = self.args
-        output_dir = getattr(args, 'output_dir', None) or getattr(args, 'save')
-        self._save_val_dataset(output_dir, val_dataset)
+        self._save_val_dataset(val_dataset)
         is_grpo = hasattr(args, 'rlhf_type') and args.rlhf_type == 'grpo'
         predict_with_generate = getattr(args, 'predict_with_generate', False)
         if not is_grpo:
             if args.packing:
                 packing_dataset_cls = IterablePackingDataset if args.streaming else PackingDataset
                 train_dataset = packing_dataset_cls(
-                    self.template, train_dataset, num_proc=args.dataset_num_proc, strict=args.strict)
+                    self.template,
+                    train_dataset,
+                    num_proc=args.dataset_num_proc,
+                    strict=args.strict,
+                    load_from_cache_file=args.load_from_cache_file)
                 if val_dataset is not None:
                     val_dataset = packing_dataset_cls(
-                        self.template, val_dataset, num_proc=args.dataset_num_proc, strict=args.strict)
+                        self.template,
+                        val_dataset,
+                        num_proc=args.dataset_num_proc,
+                        strict=args.strict,
+                        load_from_cache_file=args.load_from_cache_file)
             elif args.lazy_tokenize:
                 train_dataset = LazyLLMDataset(
                     train_dataset, template.encode, strict=args.strict, random_state=args.data_seed)
@@ -258,6 +257,11 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             if is_master():
                 inputs = train_dataset[0] if hasattr(train_dataset, '__len__') else next(iter(train_dataset))
                 template.print_inputs(inputs, tokenizer_kwargs=inputs.pop('tokenizer_kwargs', None) or {})
+            elif hasattr(train_dataset, '__len__'):
+                # Avoid the random mismatch issue in LazyLLMDataset.
+                inputs = train_dataset[0]
+            if val_dataset is not None and hasattr(val_dataset, '__len__') and len(val_dataset) == 0:
+                val_dataset = None
             if isinstance(train_dataset, (HfDataset, PackingDataset)):
                 self.train_msg['train_dataset'] = self._stat_dataset(train_dataset)
                 if val_dataset is not None and not predict_with_generate:

@@ -13,6 +13,7 @@ pip install -U trl
 The GRPOTrainer has been refactored in swift 3.5.dev. If you are using a version of Swift < 3.5 , please refer to the[stable doc](https://github.com/modelscope/ms-swift/blob/v3.4.1/docs/source_en/Instruction/GRPO.md)
 
 **Dev Log**
+- **2025-05-29** — Support padding_free(--padding_free true) and sequence_parallel(--sequence_parallel_size N).
 - **2025-05-23** — Added support for custom sampling batch size (see parameters: generation_batch_size / steps_per_generation).
 - **2025-05-22** — swift rollout now supports the data_parallel_size parameter.
 - **2025-05-16** - Implemented ref_model synchronization logic (see parameter: sync_ref_model).
@@ -52,7 +53,7 @@ When running in Colocate Mode , out-of-memory (OOM) errors are common due to sim
 --sleep_level 1
 ```
 
-2. Offload training model and optimizer memory during vLLM inference:
+2. Offload model and optimizer memory during vLLM inference:
 
 ```bash
 --offload_optimizer true \
@@ -218,9 +219,10 @@ Arguments
 - use_vllm: Whether to use vLLM as the infer_backend for GRPO generation, default is False.
 - vllm_mode: Mode to use for vLLM integration when `use_vllm` is set to `True`. Must be one of `server` or `colocate`
 - vllm_mode server parameter
+  - vllm_server_base_url: Base URL for the vLLM server (e.g., 'http://localhost:8000'). If provided, `vllm_server_host` " "and `vllm_server_port` are ignored. Default is None.
   - vllm_server_host: The host address of the vLLM server. Default is None. This is used when connecting to an external vLLM server.
   - vllm_server_port: The service port of the vLLM server. Default is 8000.
-  - vllm_server_timeout: The connection timeout for the vLLM server. Default is 120 seconds.
+  - vllm_server_timeout: The connection timeout for the vLLM server. Default is 240 seconds.
   - async_generate: Use async rollout to improve train speed. Note that rollout will use the model updated in the previous round when enabled. Multi-turn scenarios are not supported. Default is `false`.
 - vllm_mode colocate parameter
   - vllm_gpu_memory_utilization: vLLM passthrough parameter, default is 0.9.
@@ -229,24 +231,27 @@ Arguments
   - vllm_limit_mm_per_prompt: vLLM passthrough parameter, default is None.
   - vllm_tensor_parallel_size: the tensor parallel size of vLLM engine, default is 1.
   - sleep_level: make vllm sleep when model is training. Options are 0 or 1, default is 0, no sleep
+  - offload_optimizer: Whether to offload optimizer parameters during inference with vLLM. The default is `False`.
+  - offload_model: Whether to offload the model during inference with vLLM. The default is `False`.
+  - gc_collect_after_offload: Whether to perform garbage collection (both Python GC and GPU GC) after offloading. The default is `False`.
+  - completion_length_limit_scope: Specifies the scope of the `max_completion_length` limit in multi-turn conversations.
+  When set to `total`, the total output length across all turns must not exceed `max_completion_length`.
+  When set to `per_round`, each individual turn's output length is limited separately.
+  Defaults to `per_round`. Currently only takes effect in colocate mode.
 - num_iterations: number of iterations per batch. Default is 1.
 - epsilon: epsilon value for clipping. Default is 0.2.
 - epsilon_high: Upper clip coefficient, default is None. When set, it forms a clipping range of [epsilon, epsilon_high] together with epsilon.
+- delta: Delta value for the upper clipping bound in two-sided GRPO. Recommended to be > 1 + epsilon. This method was introduced in the [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291).
 - sync_ref_model: Whether to synchronize the reference model. Default is False。
   - ref_model_mixup_alpha: The Parameter controls the mix between the current policy and the previous reference policy during updates. The reference policy is updated according to the equation: $π_{ref} = α * π_θ + (1 - α) * π_{ref_{prev}}$. Default is 0.6.
   - ref_model_sync_steps：The parameter determines how frequently the current policy is synchronized with the reference policy. Default is 512.
-- move_model_batches: When moving model parameters to fast inference frameworks such as vLLM, determines how many batches to divide the layers into. The default is `None`, which means the entire model is not split. Otherwise, the model is split into `move_model_batches + 1` (non-layer parameters) + `1` (multi-modal component parameters) batches.
-- offload_optimizer: Whether to offload optimizer parameters during inference with vLLM. The default is `False`.
-- offload_model: Whether to offload the model itself during inference with vLLM. The default is `False`.
-- gc_collect_after_offload: Whether to perform garbage collection (both Python GC and GPU GC) after offloading. The default is `False`.
+- move_model_batches: When moving model parameters to fast inference frameworks such as vLLM, determines how many batches to divide the layers into. The default is `None`, which means the entire model is not split. Otherwise, the model is split into `move_model_batches + 1` (non-layer parameters) + `1` (multi-modal component parameters) batches. This parameter is only meaningful for LoRA (PEFT).
 - multi_turn_func: The multi turn GRPO plugin name. Add your multi-turn implementation in plugin/multi_turn.py.
-- completion_length_limit_scope: Specifies the scope of the `max_completion_length` limit in multi-turn conversations.
-When set to `total`, the total output length across all turns must not exceed `max_completion_length`.
-When set to `per_round`, each individual turn's output length is limited separately.
-Defaults to `per_round`. Currently only takes effect in colocate mode.
 - dynamic_sample: Exclude data within the group where the reward standard deviation is 0, and additionally sample new data. Default is False.
 - max_resample_times: Under the dynamic_sample setting, limit the number of resampling attempts to a maximum of 3. Default is 3 times.
 - overlong_filter: Skip overlong truncated samples, which will not be included in loss calculation. Default is False.
+- padding_free: Remove all padding tokens，and concat all valid tokens to one batch，only supports flash_attn.
+- sequence_parallel_size: The segment number of sequence parallels.
 The hyperparameters for the reward function can be found in the [Built-in Reward Functions section](#built-in-reward-functions).
 
 You can use vLLM as sampling backends to accelerate training.
@@ -296,6 +301,60 @@ Notes:
 1. In the GRPOTrainer, reward_model instances are appended sequentially to reward_funcs. Therefore, the order of reward_weights corresponds to [reward_funcs, reward_model].
 2. The default value for reward_model_plugin is default, which uses the ORM processing logic.
 
+## Multi-task training
+
+We can add a column to the dataset to identify the task type and make judgments based on the task type in the reward function/reward model plugin, thereby enabling multi-task training. Suppose the dataset contains math and programming tasks, such as:
+```
+    {"query": "Solve the equation x + 2 = 5", "solution": "3", "task": "math"},
+    {"query": "Write a function to calculate the Fibonacci sequence", "solution": "xxx", "task": "code"},
+    {"query": "What is the integral of x^2?", "solution": "xxx", "task": "math"},
+    {"query": "Implement a sorting algorithm in Python", "solution": "xxx", "task": "code"},
+```
+
+Below are examples of reward functions for different tasks:
+
+```python
+from swift.plugin import ORM, orms
+
+# Math-specific reward function
+from swift.plugin import ORM, orms
+import random
+
+# Math-specific reward function
+class MathRandomReward(ORM):
+  def __call__(self, completions, task, **kwargs):
+      rewards = []
+      for completion, t in zip(completions, task):
+          if t == "math":
+              import random
+              # imple math accuracy logic
+              reward = random.random()
+              rewards.append(reward)
+          else:
+              # Return None for non-math tasks
+              rewards.append(None)
+      return rewards
+
+# Coding-specific reward function
+class CodeRandomReward(ORM):
+  def __call__(self, completions, task, **kwargs):
+      rewards = []
+      for completion, t in zip(completions, task):
+          if t == "code":
+              # imple coding accuracy logic
+              reward = random.random()
+              rewards.append(reward)
+          else:
+              # Return None for non-coding tasks
+              rewards.append(None)
+      return rewards
+
+orms['math_reward'] = MathRandomReward
+orms['code_reward'] = CodeRandomReward
+```
+
+For data that does not belong to the current task, it is handled by returning None, ensuring that the reward calculation only applies to data within the task.
+
 
 ## DAPO
 Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO) introduces several tricks based on GRPO, which are:
@@ -312,7 +371,7 @@ The token-level loss is implemented by using the loss type bnpo.
 
 | Parameter                 | Type      | Value      |
 |----------------------|-----------|-------------|
-｜`--loss_type`        | `str`      | `bnpo`     |
+| `--loss_type`        | `str`      | `bnpo`     |
 | `--epsilon_high`     | `float`   | `0.28`      |
 | `--dynamic_sample`   | `bool`    | `true`      |
 | `--overlong_filter`  | `bool`    | `true`      |
@@ -375,7 +434,21 @@ See reference: [issue](https://github.com/modelscope/ms-swift/issues/3912)
 
 **5. Why is clip_ratio always 1?**
 
-When num_iterations = 1 and async_generate = False, it's on-policy RL, and old_policy is equal to policy.
+The core purpose of the Clip mechanism is to limit the magnitude of policy updates, preventing a single update from being too large and causing a collapse in policy performance (i.e., a sudden drop in performance after the policy is updated). The specific formula for the Clip operation is as follows:
+
+$$
+L_{\text{CLIP}}(\theta) = \mathbb{E}_{t} \left[ \min\left(r_{t}(\theta) \hat{A}_{t}, \text{clip}(r_{t}(\theta), 1 - \epsilon, 1 + \epsilon) \hat{A}_{t} \right) \right]
+$$
+
+Where $r_{t}(\theta) = \frac{\pi_{\theta}(a_{t} \mid s_{t})}{\pi_{\text{old}}(a_{t} \mid s_{t})}$ is the importance sampling ratio, measuring the difference between the new and old policies. $\hat{A}_{t}$ is the advantage function, representing the relative reward of an action. $\epsilon$ is used to limit the deviation range of  $r_{t}(\theta)$
+
+
+Therefore, the importance sampling is always equal to 1, and in this case, the clip operation will not take effect.
+
+Under the following parameter settings, the algorithm is off-policy (near-on-policy).
+
+1. num_iterations > 1
+2. steps_per_generation > gradient_accumulation_steps
 
 See reference: [issue](https://github.com/huggingface/open-r1/issues/239#issuecomment-2646297851)
 

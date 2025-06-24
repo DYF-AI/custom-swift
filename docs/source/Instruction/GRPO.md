@@ -13,9 +13,10 @@ pip install -U trl
 GRPOTrainer在swift3.5.dev进行了代码重构，如果你使用的swift版本<3.5, 请参考[stable文档](https://github.com/modelscope/ms-swift/blob/v3.4.1/docs/source/Instruction/GRPO.md)
 
 **更新日志**
-- **2025-05-23** — 支持自定义采样批量大小，参考 generation_batch_size / steps_per_generation 参数
-- **2025-05-22** — swift rollout 支持 data_parallel_size 参数
-- **2025-05-16** - 增加 ref_model 同步逻辑，参考参数 sync_ref_model
+- **2025-05-29** — 支持了padding_free(--padding_free true)和序列并行(--sequence_parallel_size N)。
+- **2025-05-23** — 支持自定义采样批量大小，参考 generation_batch_size / steps_per_generation 参数。
+- **2025-05-22** — swift rollout 支持 data_parallel_size 参数。
+- **2025-05-16** - 增加 ref_model 同步逻辑，参考参数 sync_ref_model。
 - **2025-05-13** — 为了代码的可读性和维护性， GRPOTrainer代码重构，Internal mode 支持vLLM>=0.8。
 - **2025-05-11** — 支持生成式奖励模型，通过 reward_model_plugin 自定义奖励模型逻辑。有关更多详细信息，请参阅[自定义奖励模型](#自定义奖励模型)部分。
 - **2025-04-30** — external vllm server 的启动命令改为 `swift rollout`。
@@ -45,7 +46,7 @@ GRPO 训练框架支持集成高性能推理引擎（如 vLLM）来加速采样�
 --sleep_level 1
 ```
 
-2. 在vLLM 推理阶段，释放训练模型和优化器占用的显存：
+2. 在vLLM 推理阶段，释放模型和优化器占用的显存：
 
 ```bash
 --offload_optimizer true \
@@ -208,9 +209,10 @@ A conversation between User and Assistant. The user asks a question, and the Ass
 - use_vllm: 是否使用 vLLM 作为 GRPO 生成的 infer_backend，默认为False。
 - vllm_mode: vLLM 集成模式，可选项为 `server` 和 `colocate`。server 模式使用 `swift rollout` 拉起的 vLLM 服务器进行采样，colocate 模式在程序内部署 vLLM。
 - vllm_mode server 参数
+  - vllm_server_base_url: vLLM server的Base URL(比如 http://local_host:8000), 默认为None。设置后，忽略host和port设置。
   - vllm_server_host：vLLM server host地址，默认为None，使用外部vLLM server时使用.
   - vllm_server_port vLLM server 服务端口，默认为8000.
-  - vllm_server_timeout 连接vLLM server的超时时间，默认为120s.
+  - vllm_server_timeout 连接vLLM server的超时时间，默认为 240s.
   - async_generate: 异步rollout以提高训练速度，注意开启时采样会使用上一轮更新的模型进行采样，不支持多轮场景。默认`false`.
 - vllm_mode colocate 参数
   - vllm_gpu_memory_utilization: vllm透传参数，默认为0.9.
@@ -219,23 +221,26 @@ A conversation between User and Assistant. The user asks a question, and the Ass
   - vllm_limit_mm_per_prompt: vllm透传参数，默认为None.
   - vllm_enable_prefix_caching: vllm透传参数，默认为True.
   - sleep_level: 训练时释放 vLLM 显存，可选项为[0, 1], 默认为0，不释放.
+  - offload_optimizer: 是否在vLLM推理时offload optimizer参数，默认为False。
+  - offload_model: 是否在vLLM推理时 offload 模型，默认为False。
+  - gc_collect_after_offload: 是否在offload结束时进行gc（python gc和GPU gc），默认为False。
+  - completion_length_limit_scope: 在多轮对话中，`max_completion_length` 的限制范围。
+  `total`限制所有对话轮次的总输出长度不超过`max_completion_length`, `per_round`限制每一轮的输出长度。
+  默认为`per_round`, 当前仅对 colocate mode 生效。
 - num_iterations: 每个批次代更新次数，默认为1。
 - epsilon: clip 系数，默认为0.2。
 - epsilon_high: upper clip 系数，默认为None，设置后与epsilon共同构成[epsilon, epsilon_high]裁剪范围。
+- delta: [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291)中双侧 GRPO 上界裁剪值。若设置，建议大于 1 + epsilon。默认为None。
 - sync_ref_model: 是否定期同步ref_model，默认为False。
 - ref_model_mixup_alpha: 控制在更新过程中model和先前ref_model之间的混合。更新公式为 $π_{ref} = α * π_θ + (1 - α) * π_{ref_{prev}}$。默认为0.6。
 - ref_model_sync_steps：同步频率，默认为512。
-- move_model_batches: 在模型向vLLM等快速推理框架移动参数时，将layers分为多少个batch. 默认为None, 代表整个模型不进行拆分，否则拆分为move_model_batches+1(非layer参数)+1(多模态部分参数)个。
-- offload_optimizer: 是否在vLLM推理时offload optimizer参数，默认为False。
-- offload_model: 是否在vLLM推理时offload 模型本身，默认为False。
-- gc_collect_after_offload: 是否在offload结束时进行gc（python gc和GPU gc），默认为False。
+- move_model_batches: 在模型向vLLM等快速推理框架移动参数时，将layers分为多少个batch. 默认为None, 代表整个模型不进行拆分，否则拆分为move_model_batches+1(非layer参数)+1(多模态部分参数)个。注意：该参数仅对LoRA(PEFT)训练有意义。
 - multi_turn_func: 多轮GRPO参数, 传入对应的plugin名称, 同时在plugin/multi_turn.py中添加好对应的实现。
-- completion_length_limit_scope: 在多轮对话中，`max_completion_length` 的限制范围。
-`total`限制所有对话轮次的总输出长度不超过`max_completion_length`, `per_round`限制每一轮的输出长度。
-默认为`per_round`, 当前仅对 colocate mode 生效。
 - dynamic_sample：筛除group内奖励标准差为0的数据，额外采样新数据，默认为False。
 - max_resample_times：dynamic_sample设置下限制重采样次数，默认3次。
 - overlong_filter：跳过超长截断的样本，不参与loss计算，默认为False。
+- padding_free: 去掉所有padding token，并将有效token拼接到一个batch中，仅支持flash_attn.
+- sequence_parallel_size: 序列并行段数
 
 奖励函数参数，见[内置奖励函数](#内置奖励函数)
 
@@ -282,6 +287,55 @@ swift rlhf \
 1. 在 GRPOTrainer 中，reward_model 会依次append到 reward_funcs 中。因此，reward_weights 的顺序对应 [reward_funcs, reward_model]。
 2. reward_model_plugin 默认为 default，即使用 ORM 处理逻辑。
 
+## 多任务训练
+我们可以在数据集中添加一个用于标识任务类型的列，并在奖励函数/奖励模型插件中根据任务类型进行判断，从而实现多任务训练。假设数据集中包含数学和编程任务，比如：
+
+```
+    {"query": "Solve the equation x + 2 = 5", "solution": "3", "task": "math"},
+    {"query": "Write a function to calculate the Fibonacci sequence", "solution": "xxx", "task": "code"},
+    {"query": "What is the integral of x^2?", "solution": "xxx", "task": "math"},
+    {"query": "Implement a sorting algorithm in Python", "solution": "xxx", "task": "code"},
+```
+
+下面是针对不同任务的奖励函数的示例：
+
+```python
+from swift.plugin import ORM, orms
+import random
+
+# Math-specific reward function
+class MathRandomReward(ORM):
+  def __call__(self, completions, task, **kwargs):
+      rewards = []
+      for completion, t in zip(completions, task):
+          if t == "math":
+              import random
+              # imple math accuracy logic
+              reward = random.random()
+              rewards.append(reward)
+          else:
+              # Return None for non-math tasks
+              rewards.append(None)
+      return rewards
+
+# Coding-specific reward function
+class CodeRandomReward(ORM):
+  def __call__(self, completions, task, **kwargs):
+      rewards = []
+      for prompt, completion, t in zip(prompts, completions, task):
+          if t == "code":
+              # imple coding accuracy logic
+              reward = random.random()
+              rewards.append(reward)
+          else:
+              # Return None for non-coding tasks
+              rewards.append(None)
+      return rewards
+
+orms['math_reward'] = MathRandomReward
+orms['code_reward'] = CodeRandomReward
+```
+对于非当前任务的数据， 通过返回 None 来处理，从而使得奖励相关仅计算任务内的数据。
 
 ## DAPO
 [Decoupled Clip and Dynamic sAmpling Policy Optimization (DAPO)](https://arxiv.org/abs/2503.14476)在GRPO的基础上设置了几种trick，分别是
@@ -297,7 +351,7 @@ swift rlhf \
 
 | 参数                 | 类型      | 值      |
 |----------------------|-----------|-------------|
-｜`--loss_type`        | `str`      | `bnpo`     |
+|`--loss_type`        | `str`      | `bnpo`     |
 | `--epsilon_high`     | `float`   | `0.28`      |
 | `--dynamic_sample`   | `bool`    | `true`      |
 | `--overlong_filter`  | `bool`    | `true`      |
@@ -358,7 +412,22 @@ num_generations = 64
 
 **5. clip_ratio为什么总是1?**
 
-num_iterations = 1，async_generate = False 下为 on-policy RL，old_policy此时等于policy
+Clip机制的核心目的是限制策略更新的幅度，防止因单次更新过大而导致策略性能崩溃（即策略更新后表现急剧下降）。
+Clip操作的具体公式如下：
+
+$$
+L_{\text{CLIP}}(\theta) = \mathbb{E}_{t} \left[ \min\left(r_{t}(\theta) \hat{A}_{t}, \text{clip}(r_{t}(\theta), 1 - \epsilon, 1 + \epsilon) \hat{A}_{t} \right) \right]
+$$
+
+其中：$r_{t}(\theta) = \frac{\pi_{\theta}(a_{t} \mid s_{t})}{\pi_{\text{old}}(a_{t} \mid s_{t})}$ 是重要性采样比，衡量新旧策略的差异。$\hat{A}_{t}$ 是优势函数（advantage function），表示动作的相对收益。$\epsilon$ 用于限制 $r_{t}(\theta)$ 的偏离范围。
+
+在 on-policy 训练过程中，由于每次更新都使用最新策略生成的数据，新旧策略相同，即 $\pi_{\theta} = \pi_{\text{old}}$
+
+因此重要性采样比恒为 1，此时，clip 操作不会生效。
+
+在设置以下参数情况下，算法为off-policy (near-on-policy)
+1. num_iterations > 1
+2. steps_per_generation > gradient_accumulation_steps
 
 参考[issue](https://github.com/huggingface/open-r1/issues/239#issuecomment-2646297851)
 
