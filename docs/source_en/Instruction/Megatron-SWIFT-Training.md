@@ -271,7 +271,7 @@ seq_length: Defaults to None, meaning it is set to `max_length`. To restrict the
 - group_query_attention: Default is None. If `num_query_groups > 1`, group_query_attention is set to True, otherwise False.
 - num_query_groups: Default is 1.
 - max_position_embeddings: Maximum length of positional embeddings, default is None.
-- position_embedding_type: Type of positional embedding, options are 'learned_absolute', 'rope', 'relative', and 'none'. Default is 'rope'.
+- position_embedding_type: Type of positional embedding, options are 'learned_absolute', 'rope', 'mrope', 'relative', and 'none'. Default is 'rope'.
 - rotary_base: Default is 10000.
 - rotary_percent: Default is 1.
 - normalization: Options are 'LayerNorm', 'RMSNorm'. Default is RMSNorm.
@@ -297,7 +297,7 @@ seq_length: Defaults to None, meaning it is set to `max_length`. To restrict the
 - moe_router_topk: The number of experts each token is routed to. Default is None. Automatically read from config.json.
 - moe_router_pre_softmax: Enable pre-softmax routing for MoE, meaning that softmax will be applied before top-k selection. Default is None. Automatically read from config.json.
 - 🔥moe_aux_loss_coeff: Scaling coefficient for the auxiliary loss: the recommended initial value is 1e-2. Default is None. Automatically read from config.json.
-- moe_router_dtype: Data type for routing computation and expert output weighted averaging. Options include 'fp32' and 'fp64', which enhance numerical stability, particularly with a large number of experts. When used with `moe_permute_fusion`, the performance impact is negligible. Defaults to None (no dtype change).
+- moe_router_dtype: Data type for routing computation and expert output weighted averaging. Options include 'none', 'fp32' and 'fp64', which enhance numerical stability, particularly with a large number of experts. When used with `moe_permute_fusion`, the performance impact is negligible. The default is 'fp32'. 'none' means no change to the data type.
 - moe_permute_fusion: Fuses token rearrangement operations during token dispatching. Defaults to False.
 - 🔥expert_model_parallel_size: The degree of expert parallelism, default is 1.
 - moe_token_dispatcher_type: The type of token dispatcher to use. Options include 'allgather', 'alltoall', 'flex', and 'alltoall_seq'. Default is 'alltoall'.
